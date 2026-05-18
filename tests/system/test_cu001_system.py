@@ -2,7 +2,7 @@ import pytest
 import asyncio
 import websockets
 import json
-from subsystems.leviathan_streamers.main import start_app
+from main import start_app
 
 @pytest.mark.asyncio
 async def test_system_end_to_end():
