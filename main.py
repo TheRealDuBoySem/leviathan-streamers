@@ -1,5 +1,3 @@
-# Rerun workflow
-
 import asyncio
 import logging
 import os
