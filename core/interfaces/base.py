@@ -1,6 +1,6 @@
 from abc import ABC, abstractmethod
 from typing import Optional, List, Any, Callable, Awaitable, AsyncIterator
-from core.models.trade_tick import TradeTick
+from leviathan_common.models.trade_tick import TradeTick
 
 # Pattern: Strategy
 # Used to encapsulate parsing, protocol and dispatch algorithms,
@@ -71,13 +71,7 @@ class IDispatchStrategy(ABC):
 # Allows multiple components to react to new trade ticks without
 # the stream orchestrator knowing about them.
 
-class IPriceObserver(ABC):
-    @abstractmethod
-    async def on_price_update(self, tick: TradeTick) -> None:
-        """
-        Méthode de callback appelée lors de la réception d'un nouveau tick.
-        """
-        pass # pragma: no cover
+from leviathan_common.interfaces.base import IPriceObserver
 
 class IExchangeStream(ABC):
     @abstractmethod

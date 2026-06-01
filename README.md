@@ -101,13 +101,28 @@ This engine is built around advanced academic software design principles rather 
 
 ## ⚡ Quickstart & Interactive Demo
 
-You don't need live API keys or external credentials to see the system's extreme resilience in action. A lightweight, simulated exchange server is packaged to demonstrate full network recovery.
+You don't need live API keys or external credentials to see the system's extreme resilience in action. A simulated exchange server is packaged to demonstrate full network recovery.
 
-### Run the Interactive Demo in 1 Command
-Clone the repository and run the pre-packaged showcase script:
+### 📋 Prerequisites & Dependency
 
+This subsystem depends on the shared package **[leviathan-common](https://github.com/TheRealDuBoySem/leviathan-common.git)**. You must install it first for the stream engine and demo to function.
+
+#### 1. Install `leviathan-common`
+Clone and install the common module in editable/development mode:
 ```bash
-git clone https://github.com/TheRealDuBoySem/leviathan-streamers.git && cd leviathan-streamers && pip install -r requirements.txt && python demo.py
+git clone https://github.com/TheRealDuBoySem/leviathan-common.git
+cd leviathan-common
+pip install -e .
+cd ..
+```
+
+#### 2. Install & Run `leviathan-streamers`
+Clone the streamers repository, install requirements, and run the demo:
+```bash
+git clone https://github.com/TheRealDuBoySem/leviathan-streamers.git
+cd leviathan-streamers
+pip install -r requirements.txt
+python demo.py
 ```
 
 ### What You Will See in the Demo:
