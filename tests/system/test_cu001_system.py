@@ -1,3 +1,7 @@
+import sys
+import os
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
+
 import pytest
 import asyncio
 import websockets
@@ -13,8 +17,9 @@ async def test_system_end_to_end():
         await websocket.send(json.dumps(trade_data))
         await asyncio.sleep(2)
         
-    async with websockets.serve(mock_bitget_server, "localhost", 8765):
-        messages_processed = await asyncio.wait_for(start_app("ws://localhost:8765", ["BTCUSDT"], max_messages=1), timeout=5.0)
+    async with websockets.serve(mock_bitget_server, "localhost", 0) as server:
+        port = server.sockets[0].getsockname()[1]
+        messages_processed = await asyncio.wait_for(start_app(f"ws://localhost:{port}", ["BTCUSDT"], max_messages=1), timeout=5.0)
         assert messages_processed == 1
 
 @pytest.mark.asyncio
