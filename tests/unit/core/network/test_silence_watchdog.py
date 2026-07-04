@@ -62,13 +62,16 @@ def test_watchdog_properties(mocker):
 
 def test_watchdog_timeout_boundary(mocker):
     """Health remains True at the exact timeout, False immediately after."""
-    current_time = time.monotonic()
-    mocker.patch("time.monotonic", return_value=current_time)
+    current_time = 1_000_000.0
+    monotonic_mock = mocker.patch(
+        "core.network.silence_watchdog.time.monotonic",
+        return_value=current_time,
+    )
     w = SilenceWatchdog(timeout_seconds=2)
 
-    mocker.patch("time.monotonic", return_value=current_time + 2)
+    monotonic_mock.return_value = current_time + 2.0
     assert w.check_health() is True
 
-    mocker.patch("time.monotonic", return_value=current_time + 2.001)
+    monotonic_mock.return_value = current_time + 2.001
     assert w.check_health() is False
 
