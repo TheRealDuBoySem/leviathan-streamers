@@ -48,9 +48,10 @@ def test_watchdog_properties(mocker):
     assert w.last_activity == current_time
     assert w.elapsed_silence == 0.0
 
-    # Advance time and verify elapsed_silence increases
+    # Advance time and verify elapsed_silence increases. Use approx because monotonic()
+    # returns a large float, so (current_time + 4.5) - current_time carries FP rounding noise.
     mocker.patch("time.monotonic", return_value=current_time + 4.5)
-    assert w.elapsed_silence == 4.5
+    assert w.elapsed_silence == pytest.approx(4.5)
 
     # Verify that properties are read-only
     with pytest.raises(AttributeError):
