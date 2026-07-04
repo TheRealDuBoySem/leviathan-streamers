@@ -1,6 +1,12 @@
 import pytest
 import asyncio
 from unittest.mock import AsyncMock, patch
+
+_original_sleep = asyncio.sleep
+
+async def mock_sleep_yield(delay):
+    await _original_sleep(0)
+
 from core.network.reconnecting_ws_manager import ReconnectingWebSocketManager, MaxRetriesExceededError
 from core.network.retry_policy import RetryPolicy
 from core.network.silence_watchdog import SilenceWatchdog
@@ -25,7 +31,8 @@ def test_reconnecting_ws_manager_factory():
         url="ws://test",
         max_retries=10,
         timeout_seconds=45,
-        keep_alive_interval=15
+        keep_alive_interval=15,
+        keep_alive_payload="custom_heartbeat"
     )
     assert isinstance(mgr, ReconnectingWebSocketManager)
     # Check new public inspectable properties
@@ -33,10 +40,23 @@ def test_reconnecting_ws_manager_factory():
     assert mgr.retry_policy.max_retries == 10
     assert mgr.watchdog.timeout_seconds == 45
     assert mgr.keep_alive.interval_seconds == 15
+    assert mgr.keep_alive.payload == "custom_heartbeat"
+    assert mgr.connect_timeout == 10.0
 
     # Check new default of max_retries=None
     mgr_default = ReconnectingWebSocketManager.create_default(url="ws://test")
     assert mgr_default.retry_policy.max_retries is None
+    assert mgr_default.keep_alive.payload == "ping"
+
+    # Check keep_alive_payload type check
+    with pytest.raises(TypeError, match="keep_alive_payload must be a string"):
+        ReconnectingWebSocketManager.create_default(url="ws://test", keep_alive_payload=123)
+
+    with pytest.raises(ValueError, match="url cannot be empty"):
+        ReconnectingWebSocketManager.create_default(url="")
+
+    with pytest.raises(ValueError, match="connect_timeout must be strictly positive"):
+        ReconnectingWebSocketManager.create_default(url="ws://test", connect_timeout=0)
 
 
     # Check that they are read-only
@@ -82,7 +102,7 @@ async def test_listen_loop_retry_on_error():
     # Attempt 0 fails (Exception), Attempt 1 succeeds. max_retries=2 means attempt < 2 is OK (0, 1).
     mgr = ReconnectingWebSocketManager("ws://t", RetryPolicy(max_retries=2), SilenceWatchdog(), KeepAliveEmitter())
     with patch("websockets.connect", side_effect=[Exception("net error"), BaseMockWS()]):
-        with patch("asyncio.sleep", return_value=None):
+        with patch("asyncio.sleep", mock_sleep_yield):
             async for msg in mgr.start_connection_and_listen():
                 if msg == "msg1":
                     await mgr.stop()
@@ -166,6 +186,8 @@ def test_contracts():
         asyncio.run(mgr.send(123))
     with pytest.raises(ValueError, match="message cannot be empty"):
         asyncio.run(mgr.send(""))
+    with pytest.raises(ConnectionError, match="WebSocket is not connected"):
+        asyncio.run(mgr.send("hello"))
 
     # 3. Type validation tests for create_default factory method
     with pytest.raises(TypeError, match="url must be a string"):
@@ -188,11 +210,8 @@ async def test_health_loop_watchdog_failure():
     mock_ws = BaseMockWS()
     mgr = ReconnectingWebSocketManager("ws://t", RetryPolicy(max_retries=2), FailingWatchdog(), KeepAliveEmitter())
     
-    async def fast_health_loop():
-        await mgr.disconnect()
-
     with patch("websockets.connect", return_value=mock_ws):
-        with patch.object(mgr, "_health_loop", side_effect=fast_health_loop):
+        with patch("asyncio.sleep", mock_sleep_yield):
             async for _ in mgr.start_connection_and_listen():
                 if mock_ws.closed:
                     await mgr.stop()
@@ -212,10 +231,63 @@ async def test_listen_loop_connection_closed_exception():
             raise ConnectionClosed(None, None)
 
     with patch("websockets.connect", side_effect=[ErrorMockWS(), BaseMockWS()]):
-        with patch("asyncio.sleep", return_value=None):
+        with patch("asyncio.sleep", mock_sleep_yield):
             async for msg in mgr.start_connection_and_listen():
                 if msg == "msg1":
                     await mgr.stop()
                     break
     
     assert mgr.is_stopped() is True
+
+
+@pytest.mark.asyncio
+async def test_reconnecting_ws_manager_connection_closed_code_and_await_cancel():
+    from websockets.exceptions import ConnectionClosed
+    mgr = ReconnectingWebSocketManager("ws://t", RetryPolicy(max_retries=1), SilenceWatchdog(), KeepAliveEmitter())
+    
+    class FakeWS(BaseMockWS):
+        async def __aiter__(self):
+            raise ConnectionClosed(None, None)
+            yield  # pragma: no cover - makes this an async generator, not a coroutine
+
+    with patch("websockets.connect", return_value=FakeWS()):
+        try:
+            async for _ in mgr.start_connection_and_listen():
+                pass
+        except Exception:
+            pass
+
+    assert mgr.is_connected() is False
+
+
+@pytest.mark.asyncio
+async def test_reconnecting_ws_manager_connect_timeout_retry():
+    mgr = ReconnectingWebSocketManager(
+        url="ws://t",
+        retry_policy=RetryPolicy(max_retries=1),
+        watchdog=SilenceWatchdog(),
+        keep_alive=KeepAliveEmitter(),
+        connect_timeout=0.01
+    )
+    
+    class SlowConnect(BaseMockWS):
+        async def __aenter__(self):
+            await _original_sleep(1.0)
+            return self  # pragma: no cover - cancelled by connect_timeout before returning
+
+    with patch("websockets.connect", return_value=SlowConnect()):
+        with pytest.raises(MaxRetriesExceededError):
+            async for _ in mgr.start_connection_and_listen():
+                pass  # pragma: no cover - connection never succeeds
+
+
+def test_reconnecting_ws_manager_invalid_connect_timeout():
+    with pytest.raises(TypeError, match="connect_timeout must be a float or integer"):
+        ReconnectingWebSocketManager("ws://t", RetryPolicy(), SilenceWatchdog(), KeepAliveEmitter(), connect_timeout="invalid")
+        
+    with pytest.raises(ValueError, match="connect_timeout must be strictly positive"):
+        ReconnectingWebSocketManager("ws://t", RetryPolicy(), SilenceWatchdog(), KeepAliveEmitter(), connect_timeout=0)
+        
+    with pytest.raises(TypeError, match="connect_timeout must be a float or integer"):
+        ReconnectingWebSocketManager.create_default(url="ws://t", connect_timeout="invalid")
+

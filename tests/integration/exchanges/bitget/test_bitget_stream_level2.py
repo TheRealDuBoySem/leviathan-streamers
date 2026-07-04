@@ -35,6 +35,11 @@ async def test_bottom_up_level2_bitget_stream_integration(stream):
     Vérifie la chaîne : Socket -> NetworkMgr -> Parser -> Dispatcher -> Tick
     """
     class MockWS:
+        # The manager resubscribes on connect (send()), which requires the socket to report
+        # itself connected. Expose `open` so ReconnectingWebSocketManager.is_connected() is True;
+        # without it send() raises and the message loop is never reached (the tick never arrives).
+        open = True
+
         async def __aenter__(self): return self
         async def __aexit__(self, *args): pass
         async def __aiter__(self):
@@ -49,8 +54,9 @@ async def test_bottom_up_level2_bitget_stream_integration(stream):
     with patch("websockets.connect", return_value=MockWS()):
         task = asyncio.create_task(stream.start_streaming())
         
-        # Consommation via le dispatcher réel
-        tick = await stream.wait_for_next_tick()
+        # Consommation via le dispatcher réel. Bounded wait so a regression fails fast
+        # instead of hanging the whole suite.
+        tick = await asyncio.wait_for(stream.wait_for_next_tick(), timeout=5.0)
         
         assert isinstance(tick, TradeTick)
         assert tick.inst_id == "BTCUSDT"
