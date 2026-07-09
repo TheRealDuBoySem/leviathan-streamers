@@ -181,6 +181,62 @@ def test_register_on_reconnect_validates_callback(stream):
     with pytest.raises(TypeError, match="callback must be an async function"):
         stream.register_on_reconnect(lambda: None)  # type: ignore[arg-type]
 
+
+def test_unregister_on_reconnect_validates_and_removes_callback(stream):
+    async def on_reconnect() -> None:
+        return None
+
+    stream.register_on_reconnect(on_reconnect)
+    with pytest.raises(TypeError, match="callback must be a callable awaitable"):
+        stream.unregister_on_reconnect(None)  # type: ignore[arg-type]
+    stream.unregister_on_reconnect(on_reconnect)
+
+
+def test_initial_symbols_validation_rejects_invalid_entries(mock_ws_manager, mock_parser):
+    with pytest.raises(TypeError, match="symbols must be strings"):
+        BitgetTickStream(
+            network_manager=mock_ws_manager,
+            subscription_strategy=BitgetSubscriptionProtocol(inst_type="mc"),
+            parsing_strategy=mock_parser,
+            dispatch_strategy=AsyncQueueDispatcher(),
+            symbols=["BTC", 123],
+        )
+    with pytest.raises(ValueError, match="symbols must be non-empty strings"):
+        BitgetTickStream(
+            network_manager=mock_ws_manager,
+            subscription_strategy=BitgetSubscriptionProtocol(inst_type="mc"),
+            parsing_strategy=mock_parser,
+            dispatch_strategy=AsyncQueueDispatcher(),
+            symbols=[""],
+        )
+
+
+@pytest.mark.asyncio
+async def test_handle_connect_logs_callback_errors(mocker, mock_ws_manager, mock_parser, caplog):
+    import logging
+
+    captured, original = _capture_on_connect_callback(mock_ws_manager)
+    stream = BitgetTickStream(
+        network_manager=mock_ws_manager,
+        subscription_strategy=BitgetSubscriptionProtocol(inst_type="mc"),
+        parsing_strategy=mock_parser,
+        dispatch_strategy=AsyncQueueDispatcher(),
+        symbols=["BTC"],
+    )
+    mock_ws_manager.set_on_connect_callback = original
+    handle_connect = captured[0]
+
+    async def failing_callback() -> None:
+        raise RuntimeError("boom")
+
+    stream.register_on_reconnect(failing_callback)
+    mocker.patch.object(stream, "_resubscribe_all", new_callable=AsyncMock)
+
+    with caplog.at_level(logging.ERROR):
+        await handle_connect()
+
+    assert any("Error in stream on_reconnect callback" in record.message for record in caplog.records)
+
 @pytest.mark.asyncio
 async def test_unsubscribe_method(mocker, mock_ws_manager, mock_parser):
     s = BitgetTickStream(
