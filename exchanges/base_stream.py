@@ -1,35 +1,73 @@
-import abc
 import asyncio
+import inspect
 import logging
-from abc import ABC, abstractmethod
-from typing import Optional, List, AsyncIterator
+from abc import ABC
+from typing import Optional, List, AsyncIterator, Callable, Awaitable
 
 from core.models.trade_tick import TradeTick
 from core.models.messages import TradeMessage, SystemMessage, ErrorMessage
 from core.state.subscription_registry import SubscriptionRegistry
 from core.network.reconnecting_ws_manager import ReconnectingWebSocketManager
 from core.interfaces.base import (
-    IExchangeStream, 
-    ISubscriptionStrategy, 
-    IParsingStrategy, 
+    IExchangeStream,
+    ISubscriptionStrategy,
+    IParsingStrategy,
     IDispatchStrategy,
-    IPriceObserver
+    IPriceObserver,
 )
 
 logger = logging.getLogger(__name__)
 
+
+def _validate_symbol(symbol: str, param_name: str = "symbol") -> None:
+    """Validate a single non-empty symbol string."""
+    if symbol is None:
+        raise ValueError(f"{param_name} cannot be empty")
+    if not isinstance(symbol, str):
+        raise TypeError(f"{param_name} must be a string")
+    if not symbol:
+        raise ValueError(f"{param_name} cannot be empty")
+
+
+def _validate_initial_symbols(symbols: List[str]) -> None:
+    """Validate an optional initial symbols list (may be empty)."""
+    if not isinstance(symbols, list):
+        raise TypeError("symbols must be a list")
+    for symbol in symbols:
+        if not isinstance(symbol, str):
+            raise TypeError("symbols must be strings")
+        if not symbol:
+            raise ValueError("symbols must be non-empty strings")
+
+
+def _validate_symbols_list(symbols: List[str]) -> None:
+    """Validate a non-empty list of non-empty symbol strings."""
+    if symbols is None:
+        raise ValueError("symbols list cannot be empty")
+    if not isinstance(symbols, list):
+        raise TypeError("symbols must be a list")
+    if not symbols:
+        raise ValueError("symbols list cannot be empty")
+    for symbol in symbols:
+        if not isinstance(symbol, str):
+            raise TypeError("symbols must be strings")
+        if not symbol:
+            raise ValueError("symbols must be non-empty strings")
+
+
 # Pattern: Template Method
 # Base class defining the skeleton of the streaming algorithm.
-# Subclasses only need to implement the initialization and resubscription.
+# Subclasses may override _resubscribe_all for exchange-specific resubscription.
+
 
 class BaseExchangeStream(IExchangeStream, ABC):
     def __init__(
-        self, 
+        self,
         network_manager: ReconnectingWebSocketManager,
         subscription_strategy: ISubscriptionStrategy,
         parsing_strategy: IParsingStrategy,
         dispatch_strategy: IDispatchStrategy,
-        symbols: Optional[List[str]] = None
+        symbols: Optional[List[str]] = None,
     ):
         if not isinstance(network_manager, ReconnectingWebSocketManager):
             raise TypeError("network_manager must be a ReconnectingWebSocketManager instance")
@@ -39,177 +77,183 @@ class BaseExchangeStream(IExchangeStream, ABC):
             raise TypeError("parsing_strategy must be a IParsingStrategy instance")
         if not isinstance(dispatch_strategy, IDispatchStrategy):
             raise TypeError("dispatch_strategy must be a IDispatchStrategy instance")
+        if symbols is not None:
+            _validate_initial_symbols(symbols)
 
-        self._registry = SubscriptionRegistry(initial_symbols=symbols)
-        self._subscription_strategy = subscription_strategy
-        self._parsing_strategy = parsing_strategy
-        self._dispatch_strategy = dispatch_strategy
-        self._network_manager = network_manager
-        self._observers: List[IPriceObserver] = []
-        
-        self._network_manager.set_on_connect_callback(self._resubscribe_all)
+        self.__registry = SubscriptionRegistry(initial_symbols=symbols)
+        self.__subscription_strategy = subscription_strategy
+        self.__parsing_strategy = parsing_strategy
+        self.__dispatch_strategy = dispatch_strategy
+        self.__network_manager = network_manager
+        self.__observers: List[IPriceObserver] = []
+        self.__on_reconnect_callbacks: List[Callable[[], Awaitable[None]]] = []
+
+        self.__network_manager.set_on_connect_callback(self.__handle_connect)
+
+    async def __handle_connect(self) -> None:
+        """Notifies reconnect listeners before resubscribing so backfill session state is reset first."""
+        for callback in list(self.__on_reconnect_callbacks):
+            try:
+                await callback()
+            except Exception as exc:
+                logger.error(
+                    "Error in stream on_reconnect callback %r: %s",
+                    callback,
+                    exc,
+                    exc_info=True,
+                )
+        await self._resubscribe_all()
+
+    def register_on_reconnect(self, callback: Callable[[], Awaitable[None]]) -> None:
+        """
+        Registers an async callback invoked after each successful WS connect/resubscribe cycle.
+        """
+        if callback is None or not callable(callback):
+            raise TypeError("callback must be a callable awaitable")
+        if not inspect.iscoroutinefunction(callback):
+            raise TypeError("callback must be an async function")
+        if callback not in self.__on_reconnect_callbacks:
+            self.__on_reconnect_callbacks.append(callback)
+
+    def unregister_on_reconnect(self, callback: Callable[[], Awaitable[None]]) -> None:
+        """Unregisters a callback previously added via register_on_reconnect."""
+        if callback is None or not callable(callback):
+            raise TypeError("callback must be a callable awaitable")
+        if callback in self.__on_reconnect_callbacks:
+            self.__on_reconnect_callbacks.remove(callback)
 
     @property
     def registry(self) -> SubscriptionRegistry:
-        """[Completeness] Return the subscription registry."""
-        return self._registry
+        """Return the subscription registry."""
+        return self.__registry
 
     @property
     def subscription_strategy(self) -> ISubscriptionStrategy:
-        """[Completeness] Return the subscription strategy."""
-        return self._subscription_strategy
+        """Return the subscription strategy."""
+        return self.__subscription_strategy
 
     @property
     def parsing_strategy(self) -> IParsingStrategy:
-        """[Completeness] Return the parsing strategy."""
-        return self._parsing_strategy
+        """Return the parsing strategy."""
+        return self.__parsing_strategy
 
     @property
     def dispatch_strategy(self) -> IDispatchStrategy:
-        """[Completeness] Return the dispatch strategy."""
-        return self._dispatch_strategy
+        """Return the dispatch strategy."""
+        return self.__dispatch_strategy
 
     @property
     def network_manager(self) -> ReconnectingWebSocketManager:
-        """[Completeness] Return the network manager."""
-        return self._network_manager
+        """Return the network manager."""
+        return self.__network_manager
 
     @property
     def observers(self) -> List[IPriceObserver]:
-        """[Completeness] Return a copy of the attached observers list."""
-        return list(self._observers)
+        """Return a copy of the attached observers list."""
+        return list(self.__observers)
 
     # Pattern: Observer (Observable part)
     def attach_observer(self, observer: IPriceObserver) -> None:
         if not isinstance(observer, IPriceObserver):
             raise TypeError("observer must be an IPriceObserver instance")
-        if observer not in self._observers:
-            self._observers.append(observer)
+        if observer not in self.__observers:
+            self.__observers.append(observer)
 
     def detach_observer(self, observer: IPriceObserver) -> None:
         if not isinstance(observer, IPriceObserver):
             raise TypeError("observer must be an IPriceObserver instance")
-        if observer in self._observers:
-            self._observers.remove(observer)
+        if observer in self.__observers:
+            self.__observers.remove(observer)
 
-    async def _notify_observers(self, tick: TradeTick) -> None:
-        for observer in self._observers:
+    async def __notify_observers(self, tick: TradeTick) -> None:
+        for observer in self.__observers:
             await observer.on_price_update(tick)
 
     async def wait_for_next_tick(self) -> TradeTick:
-        return await self._dispatch_strategy.wait_for_next_data()
+        return await self.__dispatch_strategy.wait_for_next_tick()
 
     def mark_tick_as_processed(self) -> None:
-        self._dispatch_strategy.task_done()
+        self.__dispatch_strategy.mark_tick_as_processed()
 
     def is_stopped(self) -> bool:
-        return self._network_manager.is_stopped()
+        return self.__network_manager.is_stopped()
 
     def is_connected(self) -> bool:
-        return self._network_manager.is_connected()
+        return self.__network_manager.is_connected()
 
     def get_active_symbols(self) -> List[str]:
-        return self._registry.get_all()
+        return self.__registry.get_all()
 
     async def __aiter__(self) -> AsyncIterator[TradeTick]:
         while not self.is_stopped():
             try:
                 yield await self.wait_for_next_tick()
             except Exception:
-                if self.is_stopped(): # pragma: no cover
+                if self.is_stopped():  # pragma: no cover
                     break
                 raise
 
     async def start_streaming(self) -> None:
         """Pattern: Template Method - The algorithm skeleton."""
-        logger.info(f"Démarrage du flux {self.__class__.__name__}.")
-        async for message in self._network_manager.start_connection_and_listen():
-            parsed_message = self._parsing_strategy.parse(message)
-            
+        logger.info("Démarrage du flux %s.", self.__class__.__name__)
+        async for message in self.__network_manager.start_connection_and_listen():
+            parsed_message = self.__parsing_strategy.parse(message)
+
             if isinstance(parsed_message, TradeMessage):
                 for tick in parsed_message.ticks:
-                    await self._dispatch_strategy.dispatch(tick)
-                    await self._notify_observers(tick)
-                        
+                    await self.__dispatch_strategy.dispatch(tick)
+                    await self.__notify_observers(tick)
+
             elif isinstance(parsed_message, SystemMessage):
                 if parsed_message.event != "pong":
                     logger.info(parsed_message.msg)
-                    
+
             elif isinstance(parsed_message, ErrorMessage):
                 logger.error(parsed_message.msg)
 
     async def stop(self) -> None:
-        await self._network_manager.stop()
+        await self.__network_manager.stop()
 
-    @abstractmethod
     async def _resubscribe_all(self) -> None:
-        pass # pragma: no cover
+        """Pattern: Template Method hook — resubscribe all active symbols after reconnect."""
+        symbols = self.get_active_symbols()
+        if symbols:
+            await self.__send_subscribe_payload(symbols)
+            logger.info("Requête globale d'abonnement envoyée pour %s.", self.__class__.__name__)
+
+    async def __send_subscribe_payload(self, symbols: List[str]) -> None:
+        payload = self.__subscription_strategy.format_subscribe(symbols)
+        await self.__network_manager.send(payload)
+
+    async def __send_unsubscribe_payload(self, symbols: List[str]) -> None:
+        payload = self.__subscription_strategy.format_unsubscribe(symbols)
+        await self.__network_manager.send(payload)
 
     async def subscribe_symbol(self, symbol: str) -> None:
-        if symbol is None:
-            raise ValueError("symbol cannot be empty")
-        if not isinstance(symbol, str):
-            raise TypeError("symbol must be a string")
-        if not symbol:
-            raise ValueError("symbol cannot be empty")
-            
-        if self._registry.add(symbol):
-            payload = self._subscription_strategy.format_subscribe([symbol])
-            await self._network_manager.send(payload)
-            logger.info(f"Abonnement dynamique : {symbol}")
+        _validate_symbol(symbol)
+        if self.__registry.add(symbol):
+            await self.__send_subscribe_payload([symbol])
+            logger.info("Abonnement dynamique : %s", symbol)
 
     async def subscribe_symbols(self, symbols: List[str]) -> None:
-        if symbols is None:
-            raise ValueError("symbols list cannot be empty")
-        if not isinstance(symbols, list):
-            raise TypeError("symbols must be a list")
-        if not symbols:
-            raise ValueError("symbols list cannot be empty")
-            
-        for s in symbols:
-            if not isinstance(s, str):
-                raise TypeError("symbols must be strings")
-            if not s:
-                raise ValueError("symbols must be non-empty strings")
-            
-        to_add = [s for s in symbols if self._registry.add(s)]
+        _validate_symbols_list(symbols)
+        to_add = [symbol for symbol in symbols if self.__registry.add(symbol)]
         if to_add:
-            payload = self._subscription_strategy.format_subscribe(to_add)
-            await self._network_manager.send(payload)
-            logger.info(f"Abonnements par lot : {to_add}")
+            await self.__send_subscribe_payload(to_add)
+            logger.info("Abonnements par lot : %s", to_add)
 
     async def unsubscribe_symbol(self, symbol: str) -> None:
-        if symbol is None:
-            raise ValueError("symbol cannot be empty")
-        if not isinstance(symbol, str):
-            raise TypeError("symbol must be a string")
-        if not symbol:
-            raise ValueError("symbol cannot be empty")
-            
-        if self._registry.remove(symbol):
-            payload = self._subscription_strategy.format_unsubscribe([symbol])
-            await self._network_manager.send(payload)
-            logger.info(f"Désabonnement dynamique : {symbol}")
+        _validate_symbol(symbol)
+        if self.__registry.remove(symbol):
+            await self.__send_unsubscribe_payload([symbol])
+            logger.info("Désabonnement dynamique : %s", symbol)
 
     async def unsubscribe_symbols(self, symbols: List[str]) -> None:
-        if symbols is None:
-            raise ValueError("symbols list cannot be empty")
-        if not isinstance(symbols, list):
-            raise TypeError("symbols must be a list")
-        if not symbols:
-            raise ValueError("symbols list cannot be empty")
-            
-        for s in symbols:
-            if not isinstance(s, str):
-                raise TypeError("symbols must be strings")
-            if not s:
-                raise ValueError("symbols must be non-empty strings")
-            
-        to_remove = [s for s in symbols if self._registry.remove(s)]
+        _validate_symbols_list(symbols)
+        to_remove = [symbol for symbol in symbols if self.__registry.remove(symbol)]
         if to_remove:
-            payload = self._subscription_strategy.format_unsubscribe(to_remove)
-            await self._network_manager.send(payload)
-            logger.info(f"Désabonnements par lot : {to_remove}")
+            await self.__send_unsubscribe_payload(to_remove)
+            logger.info("Désabonnements par lot : %s", to_remove)
 
     async def wait_until_connected(self) -> None:
         while not self.is_connected():

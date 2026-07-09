@@ -11,10 +11,10 @@ async def test_dispatcher():
     await d.dispatch(t) # Fails silently due to maxsize=1 (logs error)
     assert d.qsize() == 1
     
-    # Test wait_for_next_data and task_done
-    retrieved = await d.wait_for_next_data()
+    # Test wait_for_next_tick and mark_tick_as_processed
+    retrieved = await d.wait_for_next_tick()
     assert retrieved == t
-    d.task_done()
+    d.mark_tick_as_processed()
     assert d.empty()
 
 @pytest.mark.asyncio

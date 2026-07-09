@@ -54,7 +54,7 @@ class AsyncQueueDispatcher(IDispatchStrategy):
         except asyncio.QueueFull:
             logger.error(f"ALERTE: Consumer trop lent ! Tick jeté ({data.inst_id}).")
 
-    async def wait_for_next_data(self) -> TradeTick:
+    async def wait_for_next_tick(self) -> TradeTick:
         """
         Wait for and return the next trade tick from the queue.
         
@@ -65,8 +65,8 @@ class AsyncQueueDispatcher(IDispatchStrategy):
         assert isinstance(tick, TradeTick), "Invariant violation: non-TradeTick object in queue"
         return tick
 
-    def task_done(self) -> None:
-        """Notify that a previously enqueued task is complete."""
+    def mark_tick_as_processed(self) -> None:
+        """Notify that a previously enqueued tick has been fully processed."""
         self.__queue.task_done()
 
     def qsize(self) -> int:
