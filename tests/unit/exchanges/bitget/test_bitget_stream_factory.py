@@ -66,6 +66,19 @@ def test_bitget_stream_factory_constants():
     assert BitgetStreamFactory.DEFAULT_INST_TYPE in payload
 
 
+def test_bitget_stream_factory_dispatch_strategy():
+    """Verify custom dispatch strategy injection and contract validation."""
+    custom_dispatcher = AsyncQueueDispatcher()
+    stream = BitgetStreamFactory.create_stream(
+        url="ws://test",
+        dispatch_strategy=custom_dispatcher,
+    )
+    assert stream.dispatch_strategy is custom_dispatcher
+
+    with pytest.raises(TypeError, match="dispatch_strategy must be a IDispatchStrategy instance"):
+        BitgetStreamFactory.create_stream(url="ws://test", dispatch_strategy=object())
+
+
 def test_bitget_stream_factory_timeout_propagation():
     """Verify that timeout/keep_alive/connect parameters propagate correctly."""
     stream = BitgetStreamFactory.create_stream(

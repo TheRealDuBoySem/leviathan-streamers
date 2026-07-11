@@ -1,5 +1,6 @@
 from typing import Optional, List
 
+from core.interfaces.base import IDispatchStrategy
 from core.network.reconnecting_ws_manager import ReconnectingWebSocketManager
 from core.routing.async_queue_dispatcher import AsyncQueueDispatcher
 from exchanges.bitget.bitget_subscription_protocol import BitgetSubscriptionProtocol
@@ -32,8 +33,9 @@ class BitgetStreamFactory:
         """
         return cls.create_stream(url=url, symbols=symbols, inst_type=inst_type)
 
-    @staticmethod
+    @classmethod
     def create_stream(
+        cls,
         url: str,
         symbols: Optional[List[str]] = None,
         inst_type: str = DEFAULT_INST_TYPE,
@@ -42,6 +44,7 @@ class BitgetStreamFactory:
         keep_alive_interval: int = 30,
         keep_alive_payload: str = "ping",
         connect_timeout: float = 10.0,
+        dispatch_strategy: Optional[IDispatchStrategy] = None,
     ) -> BitgetTickStream:
         """
         Create a fully configured BitgetTickStream.
@@ -54,9 +57,11 @@ class BitgetStreamFactory:
             - url must be a non-empty string.
             - inst_type must be a non-empty string.
             - symbols, if provided, must be a list of non-empty strings.
+            - dispatch_strategy, if provided, must implement IDispatchStrategy.
 
         Postconditions:
-            - Returned stream uses default Bitget parsing and dispatch strategies.
+            - Returned stream uses default Bitget parsing and subscription strategies.
+            - dispatch_strategy defaults to AsyncQueueDispatcher when not provided.
         """
         if not isinstance(inst_type, str):
             raise TypeError("inst_type must be a string")
@@ -72,6 +77,9 @@ class BitgetStreamFactory:
                 if not symbol:
                     raise ValueError("symbols must be non-empty strings")
 
+        if dispatch_strategy is not None and not isinstance(dispatch_strategy, IDispatchStrategy):
+            raise TypeError("dispatch_strategy must be a IDispatchStrategy instance")
+
         network_manager = ReconnectingWebSocketManager.create_default(
             url=url,
             max_retries=max_retries,
@@ -82,7 +90,8 @@ class BitgetStreamFactory:
         )
         subscription_strategy = BitgetSubscriptionProtocol(inst_type=inst_type)
         parsing_strategy = BitgetMessageParser.create_default()
-        dispatch_strategy = AsyncQueueDispatcher()
+        if dispatch_strategy is None:
+            dispatch_strategy = AsyncQueueDispatcher()
 
         return BitgetTickStream(
             network_manager=network_manager,
