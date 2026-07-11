@@ -13,15 +13,24 @@ from types import TracebackType
 from typing import BinaryIO, Optional
 
 
-def _exclusive_lock_file_descriptor(fileno: int) -> None:
+def _try_acquire_exclusive_lock(fileno: int) -> None:
+    """
+    Try to acquire an exclusive lock without blocking.
+
+    Postconditions:
+        Returns when the lock is held on fileno.
+    Exceptions:
+        BlockingIOError: When the lock is held by another process.
+        OSError: When the platform lock call fails for other reasons.
+    """
     if sys.platform == "win32":
         import msvcrt
 
-        msvcrt.locking(fileno, msvcrt.LK_LOCK, 1)
+        msvcrt.locking(fileno, msvcrt.LK_NBLCK, 1)
         return
     import fcntl
 
-    fcntl.flock(fileno, fcntl.LOCK_EX)
+    fcntl.flock(fileno, fcntl.LOCK_EX | fcntl.LOCK_NB)
 
 
 def _release_file_descriptor_lock(fileno: int) -> None:
@@ -33,6 +42,10 @@ def _release_file_descriptor_lock(fileno: int) -> None:
     import fcntl
 
     fcntl.flock(fileno, fcntl.LOCK_UN)
+
+
+# Backward-compatible aliases used by coverage tests.
+_exclusive_lock_file_descriptor = _try_acquire_exclusive_lock
 
 
 class JournalFileLock:
@@ -68,7 +81,7 @@ class JournalFileLock:
             try:
                 handle = open(self.__lock_path, "a+b")
                 handle.seek(0)
-                _exclusive_lock_file_descriptor(handle.fileno())
+                _try_acquire_exclusive_lock(handle.fileno())
                 self.__handle = handle
                 return
             except OSError:

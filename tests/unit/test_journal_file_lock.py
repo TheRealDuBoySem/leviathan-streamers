@@ -41,6 +41,21 @@ def test_journal_file_lock_blocks_until_holder_releases(tmp_path):
         holder.release()
 
 
+def test_journal_file_lock_acquire_retries_on_busy_lock(mocker, tmp_path):
+    lock_path = str(tmp_path / "tick_journal.lock")
+    handle = mocker.MagicMock()
+    handle.fileno.return_value = 7
+    mocker.patch("builtins.open", return_value=handle)
+    mocker.patch(
+        "core.journal.journal_file_lock._try_acquire_exclusive_lock",
+        side_effect=[BlockingIOError(), None],
+    )
+    mocker.patch("time.sleep")
+    lock = JournalFileLock(lock_path, timeout_seconds=1.0)
+    lock.acquire()
+    assert lock.is_acquired()
+
+
 def test_journal_file_lock_rejects_invalid_lock_path():
     with pytest.raises(ValueError, match="lock_path must be a non-empty string"):
         JournalFileLock("")

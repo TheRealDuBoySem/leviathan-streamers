@@ -147,12 +147,14 @@ def test_tick_journal_maybe_compact_runs(tmp_path):
 def test_journal_file_lock_unix_branch(mocker, tmp_path):
     mock_fcntl = mocker.MagicMock()
     mock_fcntl.LOCK_EX = 2
+    mock_fcntl.LOCK_NB = 4
     mock_fcntl.LOCK_UN = 8
     mocker.patch("core.journal.journal_file_lock.sys.platform", "linux")
     mocker.patch.dict("sys.modules", {"fcntl": mock_fcntl})
     _exclusive_lock_file_descriptor(1)
     _release_file_descriptor_lock(1)
     assert mock_fcntl.flock.call_count == 2
+    assert mock_fcntl.flock.call_args_list[0].args == (1, 6)
 
 
 def test_journal_file_lock_acquire_retries_then_timeout(mocker, tmp_path):
