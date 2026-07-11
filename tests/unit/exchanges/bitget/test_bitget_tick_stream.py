@@ -1,3 +1,4 @@
+import asyncio
 import pytest
 from unittest.mock import AsyncMock, patch
 from exchanges.bitget.bitget_tick_stream import BitgetTickStream
@@ -521,3 +522,181 @@ async def test_wait_until_connected(mocker, stream):
         await stream.wait_until_connected()
 
 
+@pytest.mark.asyncio
+async def test_start_streaming_ignores_none_parse_result(mocker, stream):
+    """Parse returning None is a valid no-op per IParsingStrategy contract."""
+    async def mock_listen():
+        yield "ignored"
+
+    mocker.patch.object(
+        stream.network_manager,
+        "start_connection_and_listen",
+        side_effect=mock_listen,
+    )
+    mocker.patch.object(stream.parsing_strategy, "parse", return_value=None)
+    mock_dispatch = mocker.patch.object(
+        stream.dispatch_strategy, "dispatch", new_callable=AsyncMock
+    )
+
+    await stream.start_streaming()
+    mock_dispatch.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_start_streaming_continues_after_parse_error(mocker, stream, caplog):
+    """A single malformed message must not stop the streaming loop."""
+    import logging
+
+    async def mock_listen():
+        yield "bad"
+        yield "good"
+
+    mocker.patch.object(
+        stream.network_manager,
+        "start_connection_and_listen",
+        side_effect=mock_listen,
+    )
+
+    from core.models.trade_tick import TradeTick
+    from core.models.messages import TradeMessage
+
+    tick = TradeTick(inst_id="BTC", ts=1, price=1.0, size=1.0, side="buy", trade_id="1")
+
+    def mock_parse(msg):
+        if msg == "bad":
+            raise ValueError("malformed")
+        return TradeMessage(ticks=[tick])
+
+    mocker.patch.object(stream.parsing_strategy, "parse", side_effect=mock_parse)
+    mock_dispatch = mocker.patch.object(
+        stream.dispatch_strategy, "dispatch", new_callable=AsyncMock
+    )
+
+    with caplog.at_level(logging.ERROR):
+        await stream.start_streaming()
+
+    mock_dispatch.assert_awaited_once()
+    assert any("failed to process websocket message" in record.message for record in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_start_streaming_propagates_cancelled_error(mocker, stream):
+    """CancelledError must propagate for graceful task shutdown."""
+    async def mock_listen():
+        yield "msg"
+        raise asyncio.CancelledError()
+
+    mocker.patch.object(
+        stream.network_manager,
+        "start_connection_and_listen",
+        side_effect=mock_listen,
+    )
+    mocker.patch.object(stream.parsing_strategy, "parse", return_value=None)
+
+    with pytest.raises(asyncio.CancelledError):
+        await stream.start_streaming()
+
+
+@pytest.mark.asyncio
+async def test_notify_observers_isolates_observer_failures(mocker, stream, caplog):
+    """A failing observer must not prevent other observers or dispatch from running."""
+    import logging
+
+    healthy = mocker.Mock(spec=IPriceObserver)
+    healthy.on_price_update = AsyncMock()
+    failing = mocker.Mock(spec=IPriceObserver)
+    failing.on_price_update = AsyncMock(side_effect=RuntimeError("observer boom"))
+
+    stream.attach_observer(failing)
+    stream.attach_observer(healthy)
+
+    from core.models.trade_tick import TradeTick
+    from core.models.messages import TradeMessage
+
+    tick = TradeTick(inst_id="BTC", ts=1, price=1.0, size=1.0, side="buy", trade_id="1")
+
+    async def mock_listen():
+        yield "trade_msg"
+
+    mocker.patch.object(
+        stream.network_manager,
+        "start_connection_and_listen",
+        side_effect=mock_listen,
+    )
+    mocker.patch.object(
+        stream.parsing_strategy,
+        "parse",
+        return_value=TradeMessage(ticks=[tick]),
+    )
+    mock_dispatch = mocker.patch.object(
+        stream.dispatch_strategy, "dispatch", new_callable=AsyncMock
+    )
+
+    with caplog.at_level(logging.ERROR):
+        await stream.start_streaming()
+
+    mock_dispatch.assert_awaited_once_with(tick)
+    healthy.on_price_update.assert_awaited_once_with(tick)
+    assert any("Error in stream price observer" in record.message for record in caplog.records)
+
+
+def test_network_manager_duck_typing_accepts_compatible_manager(mock_parser):
+    """Network manager validation depends on behavior, not concrete class type."""
+    class CompatibleNetworkManager:
+        def set_on_connect_callback(self, callback):
+            self._callback = callback
+
+        async def start_connection_and_listen(self):
+            if False:
+                yield ""
+
+        async def send(self, message):
+            return None
+
+        async def stop(self):
+            return None
+
+        def is_stopped(self):
+            return False
+
+        def is_connected(self):
+            return False
+
+    manager = CompatibleNetworkManager()
+    stream = BitgetTickStream(
+        network_manager=manager,
+        subscription_strategy=BitgetSubscriptionProtocol(inst_type="mc"),
+        parsing_strategy=mock_parser,
+        dispatch_strategy=AsyncQueueDispatcher(),
+    )
+    assert stream.network_manager is manager
+
+
+def test_bitget_stream_rejects_network_manager_without_streaming_contract(mock_parser):
+    class IncompleteManager:
+        def start_connection_and_listen(self):
+            return None
+
+    with pytest.raises(TypeError, match="network_manager must provide a callable"):
+        BitgetTickStream(
+            IncompleteManager(),  # type: ignore[arg-type]
+            subscription_strategy=BitgetSubscriptionProtocol(inst_type="mc"),
+            parsing_strategy=mock_parser,
+            dispatch_strategy=AsyncQueueDispatcher(),
+        )
+
+
+@pytest.mark.asyncio
+async def test_start_streaming_propagates_cancelled_error_from_parse(mocker, stream):
+    async def mock_listen():
+        yield "msg"
+
+    mocker.patch.object(
+        stream.network_manager,
+        "start_connection_and_listen",
+        side_effect=mock_listen,
+    )
+    mocker.patch.object(stream.parsing_strategy, "parse", side_effect=asyncio.CancelledError())
+
+    with pytest.raises(asyncio.CancelledError):
+        await stream.start_streaming()

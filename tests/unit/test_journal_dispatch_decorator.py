@@ -49,7 +49,7 @@ async def test_journal_dispatch_decorator_persists_and_forwards(tmp_path):
     retrieved = await decorator.wait_for_next_tick()
     assert retrieved.trade_id == "t1"
     decorator.mark_tick_as_processed()
-    assert inner.empty()
+    assert inner.is_empty()
 
 
 def test_journal_dispatch_decorator_contracts(tmp_path):

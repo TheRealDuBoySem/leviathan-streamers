@@ -17,6 +17,16 @@ from leviathan_common.models.trade_tick import TradeTick
 
 logger = logging.getLogger(__name__)
 
+_TAIL_FOLLOW_FATAL_THRESHOLD = 10
+
+
+class JournalStreamFatalError(RuntimeError):
+    """Raised when the journal tail-follow loop cannot continue safely."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
 
 def _validate_symbol(symbol: str, param_name: str = "symbol") -> None:
     if symbol is None:
@@ -56,8 +66,8 @@ class JournalTickStream(IExchangeStream):
     Consumes ticks from TickJournal with replay then tail-follow polling.
 
     Does not open a public market WebSocket — the collector process owns WS I/O.
-    Symbol subscription tracks active symbols for IExchangeStream parity; the journal
-    delivers every persisted tick and downstream consumers apply symbol filtering.
+    ``start_streaming()`` blocks in the tail-follow loop (same contract as WS streams)
+    so orchestrators can attach a FATAL guard to the streaming task.
     """
 
     def __init__(
@@ -66,11 +76,14 @@ class JournalTickStream(IExchangeStream):
         *,
         poll_interval_seconds: float = 0.05,
         symbols: Optional[List[str]] = None,
+        on_stream_fatal: Optional[Callable[[str], None]] = None,
     ) -> None:
         if not isinstance(journal, TickJournal):
             raise TypeError("journal must be a TickJournal instance")
         if poll_interval_seconds <= 0:
             raise ValueError("poll_interval_seconds must be positive")
+        if on_stream_fatal is not None and not callable(on_stream_fatal):
+            raise TypeError("on_stream_fatal must be callable")
         initial_symbols = list(symbols or [])
         if initial_symbols:
             _validate_initial_symbols(initial_symbols)
@@ -79,14 +92,15 @@ class JournalTickStream(IExchangeStream):
         self.__symbols = initial_symbols
         self.__stopped = False
         self.__connected = False
+        self.__streaming = False
         self.__queue: asyncio.Queue[tuple[int, TradeTick]] = asyncio.Queue()
-        self.__consumer_task: Optional[asyncio.Task] = None
         self.__incremental_reader = journal.create_incremental_reader()
         self.__observers: List[IPriceObserver] = []
         self.__on_reconnect_callbacks: List[Callable[[], Awaitable[None]]] = []
         self.__cursor = journal.load_cursor()
         self.__next_seq = self.__cursor.last_processed_seq + 1
         self.__pending_seq: Optional[int] = None
+        self.__on_stream_fatal = on_stream_fatal
 
     @property
     def journal(self) -> TickJournal:
@@ -94,7 +108,7 @@ class JournalTickStream(IExchangeStream):
 
     @property
     def cursor(self) -> TickJournalCursor:
-        return self.__cursor
+        return TickJournalCursor(last_processed_seq=self.__cursor.last_processed_seq)
 
     def register_on_reconnect(self, callback: Callable[[], Awaitable[None]]) -> None:
         if callback is None or not callable(callback):
@@ -130,42 +144,101 @@ class JournalTickStream(IExchangeStream):
         for observer in self.__observers:
             await observer.on_price_update(tick)
 
-    async def start_streaming(self) -> None:
-        if self.__consumer_task is not None and not self.__consumer_task.done():
+    def __notify_stream_fatal(self, reason: str) -> None:
+        if self.__on_stream_fatal is None:
             return
+        try:
+            self.__on_stream_fatal(reason)
+        except Exception as exc:
+            logger.error(
+                "JournalTickStream on_stream_fatal callback failed: %s",
+                exc,
+                exc_info=True,
+            )
+
+    def __is_tick_for_active_subscription(self, tick: TradeTick) -> bool:
+        if not self.__symbols:
+            return True
+        return tick.inst_id in self.__symbols
+
+    def __persist_cursor_through(self, seq: int) -> None:
+        if seq > self.__cursor.last_processed_seq:
+            self.__cursor = TickJournalCursor(last_processed_seq=seq)
+            self.__journal.save_cursor(self.__cursor)
+
+    async def start_streaming(self) -> None:
+        if self.__streaming:
+            return
+        self.__streaming = True
         self.__stopped = False
         self.__connected = True
-        for callback in list(self.__on_reconnect_callbacks):
-            try:
-                await callback()
-            except Exception as exc:
-                logger.error("JournalTickStream reconnect callback failed: %s", exc, exc_info=True)
-        self.__consumer_task = asyncio.create_task(self.__tail_follow_loop())
+        try:
+            for callback in list(self.__on_reconnect_callbacks):
+                try:
+                    await callback()
+                except Exception as exc:
+                    logger.error(
+                        "JournalTickStream reconnect callback failed: %s",
+                        exc,
+                        exc_info=True,
+                    )
+            await self.__tail_follow_loop()
+        finally:
+            self.__streaming = False
+            self.__connected = False
 
     async def __tail_follow_loop(self) -> None:
+        consecutive_errors = 0
         while not self.__stopped:
-            records = self.__incremental_reader.poll(self.__next_seq)
-            if records:
-                for seq, tick in records:
-                    await self.__queue.put((seq, tick))
-                    await self.__notify_observers(tick)
-                    self.__next_seq = seq + 1
-            else:
-                await asyncio.sleep(self.__poll_interval)
+            try:
+                records = self.__incremental_reader.poll(self.__next_seq)
+                if records:
+                    consecutive_errors = 0
+                    for seq, tick in records:
+                        self.__next_seq = seq + 1
+                        if not self.__is_tick_for_active_subscription(tick):
+                            self.__persist_cursor_through(seq)
+                            continue
+                        await self.__queue.put((seq, tick))
+                        await self.__notify_observers(tick)
+                    logger.debug(
+                        "JournalTickStream read %s records; cursor now seq=%s",
+                        len(records),
+                        self.__next_seq,
+                    )
+                else:
+                    await asyncio.sleep(self.__poll_interval)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                consecutive_errors += 1
+                logger.error(
+                    "JournalTickStream tail-follow error (attempt %s): %s",
+                    consecutive_errors,
+                    exc,
+                    exc_info=True,
+                )
+                if consecutive_errors >= _TAIL_FOLLOW_FATAL_THRESHOLD:
+                    reason = "tail_follow_exhausted"
+                    logger.critical(
+                        "JournalTickStream tail-follow failed %s times consecutively",
+                        consecutive_errors,
+                    )
+                    self.__notify_stream_fatal(reason)
+                    self.__stopped = True
+                    raise JournalStreamFatalError(reason) from exc
+                await asyncio.sleep(min(self.__poll_interval * consecutive_errors, 5.0))
 
     async def stop(self) -> None:
         self.__stopped = True
         self.__connected = False
-        if self.__consumer_task is not None and not self.__consumer_task.done():
-            self.__consumer_task.cancel()
-            try:
-                await self.__consumer_task
-            except asyncio.CancelledError:
-                pass
-        self.__consumer_task = None
 
     def is_stopped(self) -> bool:
         return self.__stopped
+
+    def is_streaming(self) -> bool:
+        """Return True while the tail-follow loop is active."""
+        return self.__streaming
 
     def is_connected(self) -> bool:
         return self.__connected and not self.__stopped

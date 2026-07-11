@@ -99,9 +99,9 @@ def test_bitget_stream_factory_timeout_propagation():
 
     with pytest.raises(TypeError, match="max_retries must be an integer"):
         BitgetStreamFactory.create_stream(url="ws://test", max_retries="5")
-    with pytest.raises(TypeError, match="timeout_seconds must be an integer"):
+    with pytest.raises(TypeError, match="timeout_seconds must be a number"):
         BitgetStreamFactory.create_stream(url="ws://test", timeout_seconds="45")
-    with pytest.raises(TypeError, match="keep_alive_interval must be an integer"):
+    with pytest.raises(TypeError, match="keep_alive_interval must be a number"):
         BitgetStreamFactory.create_stream(url="ws://test", keep_alive_interval="25")
     with pytest.raises(TypeError, match="keep_alive_payload must be a string"):
         BitgetStreamFactory.create_stream(url="ws://test", keep_alive_payload=123)

@@ -55,6 +55,27 @@ def _validate_symbols_list(symbols: List[str]) -> None:
             raise ValueError("symbols must be non-empty strings")
 
 
+_REQUIRED_NETWORK_MANAGER_METHODS = (
+    "set_on_connect_callback",
+    "start_connection_and_listen",
+    "send",
+    "stop",
+    "is_stopped",
+    "is_connected",
+)
+
+
+def _validate_network_manager(network_manager: object) -> None:
+    """Validate that network_manager exposes the streaming contract (duck typing)."""
+    if network_manager is None:
+        raise TypeError("network_manager must provide streaming network operations")
+    for method_name in _REQUIRED_NETWORK_MANAGER_METHODS:
+        if not callable(getattr(network_manager, method_name, None)):
+            raise TypeError(
+                f"network_manager must provide a callable {method_name} method"
+            )
+
+
 # Pattern: Template Method
 # Base class defining the skeleton of the streaming algorithm.
 # Subclasses may override _resubscribe_all for exchange-specific resubscription.
@@ -69,8 +90,7 @@ class BaseExchangeStream(IExchangeStream, ABC):
         dispatch_strategy: IDispatchStrategy,
         symbols: Optional[List[str]] = None,
     ):
-        if not isinstance(network_manager, ReconnectingWebSocketManager):
-            raise TypeError("network_manager must be a ReconnectingWebSocketManager instance")
+        _validate_network_manager(network_manager)
         if not isinstance(subscription_strategy, ISubscriptionStrategy):
             raise TypeError("subscription_strategy must be a ISubscriptionStrategy instance")
         if not isinstance(parsing_strategy, IParsingStrategy):
@@ -166,8 +186,16 @@ class BaseExchangeStream(IExchangeStream, ABC):
             self.__observers.remove(observer)
 
     async def __notify_observers(self, tick: TradeTick) -> None:
-        for observer in self.__observers:
-            await observer.on_price_update(tick)
+        for observer in list(self.__observers):
+            try:
+                await observer.on_price_update(tick)
+            except Exception as exc:
+                logger.error(
+                    "Error in stream price observer %r: %s",
+                    observer,
+                    exc,
+                    exc_info=True,
+                )
 
     async def wait_for_next_tick(self) -> TradeTick:
         return await self.__dispatch_strategy.wait_for_next_tick()
@@ -197,19 +225,31 @@ class BaseExchangeStream(IExchangeStream, ABC):
         """Pattern: Template Method - The algorithm skeleton."""
         logger.info("Démarrage du flux %s.", self.__class__.__name__)
         async for message in self.__network_manager.start_connection_and_listen():
-            parsed_message = self.__parsing_strategy.parse(message)
+            try:
+                parsed_message = self.__parsing_strategy.parse(message)
+                if parsed_message is None:
+                    continue
 
-            if isinstance(parsed_message, TradeMessage):
-                for tick in parsed_message.ticks:
-                    await self.__dispatch_strategy.dispatch(tick)
-                    await self.__notify_observers(tick)
+                if isinstance(parsed_message, TradeMessage):
+                    for tick in parsed_message.ticks:
+                        await self.__dispatch_strategy.dispatch(tick)
+                        await self.__notify_observers(tick)
 
-            elif isinstance(parsed_message, SystemMessage):
-                if parsed_message.event != "pong":
-                    logger.info(parsed_message.msg)
+                elif isinstance(parsed_message, SystemMessage):
+                    if parsed_message.event != "pong":
+                        logger.info(parsed_message.msg)
 
-            elif isinstance(parsed_message, ErrorMessage):
-                logger.error(parsed_message.msg)
+                elif isinstance(parsed_message, ErrorMessage):
+                    logger.error(parsed_message.msg)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.error(
+                    "%s: failed to process websocket message",
+                    self.__class__.__name__,
+                    exc_info=True,
+                )
+                continue
 
     async def stop(self) -> None:
         await self.__network_manager.stop()

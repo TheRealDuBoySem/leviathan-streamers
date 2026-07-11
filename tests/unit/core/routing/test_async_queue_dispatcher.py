@@ -1,46 +1,91 @@
+import logging
+
 import pytest
+
 from core.routing.async_queue_dispatcher import AsyncQueueDispatcher
-from core.models.trade_tick import TradeTick
+from leviathan_common.models.trade_tick import TradeTick
+
+
+def _tick(inst_id: str = "B", trade_id: str = "1") -> TradeTick:
+    return TradeTick(inst_id, 1, 1.0, 1.0, "buy", trade_id)
+
 
 @pytest.mark.asyncio
-async def test_dispatcher():
-    d = AsyncQueueDispatcher(maxsize=1)
-    t = TradeTick("B", 1, 1.0, 1.0, "buy", "1")
-    await d.dispatch(t)
-    assert d.qsize() == 1
-    await d.dispatch(t) # Fails silently due to maxsize=1 (logs error)
-    assert d.qsize() == 1
-    
-    # Test wait_for_next_tick and mark_tick_as_processed
-    retrieved = await d.wait_for_next_tick()
-    assert retrieved == t
-    d.mark_tick_as_processed()
-    assert d.empty()
+async def test_dispatcher_enqueue_and_consume():
+    dispatcher = AsyncQueueDispatcher(maxsize=1)
+    tick = _tick()
+    await dispatcher.dispatch(tick)
+    assert dispatcher.qsize() == 1
+
+    await dispatcher.dispatch(tick)
+    assert dispatcher.qsize() == 1
+    assert dispatcher.dropped_tick_count == 1
+
+    retrieved = await dispatcher.wait_for_next_tick()
+    assert retrieved == tick
+    dispatcher.mark_tick_as_processed()
+    assert dispatcher.is_empty()
+
 
 @pytest.mark.asyncio
 async def test_dispatcher_contracts():
     """Verify Design by Contract preconditions for AsyncQueueDispatcher."""
     with pytest.raises(ValueError, match="maxsize must be positive"):
         AsyncQueueDispatcher(maxsize=0)
-    
-    d = AsyncQueueDispatcher()
+
+    dispatcher = AsyncQueueDispatcher()
     with pytest.raises(TypeError, match="Expected TradeTick"):
-        await d.dispatch("not a tick")
+        await dispatcher.dispatch("not a tick")
+
 
 def test_dispatcher_types():
-    """Verify Type contract preconditions for AsyncQueueDispatcher."""
+    """Verify type contract preconditions for AsyncQueueDispatcher."""
     with pytest.raises(TypeError, match="maxsize must be an integer"):
         AsyncQueueDispatcher(maxsize="10")
 
-def test_dispatcher_properties():
-    """Verify the properties of AsyncQueueDispatcher."""
-    d = AsyncQueueDispatcher(maxsize=5)
-    assert d.maxsize == 5
-    assert d.full is False
-    
-    # Verify that properties are read-only
-    with pytest.raises(AttributeError):
-        d.maxsize = 20
-    with pytest.raises(AttributeError):
-        d.full = True
 
+def test_dispatcher_properties():
+    """Verify queue introspection helpers."""
+    dispatcher = AsyncQueueDispatcher(maxsize=5)
+    assert dispatcher.maxsize == 5
+    assert dispatcher.is_full() is False
+    assert dispatcher.dropped_tick_count == 0
+
+    with pytest.raises(AttributeError):
+        dispatcher.maxsize = 20
+
+
+@pytest.mark.asyncio
+async def test_dispatcher_reports_full_queue(caplog):
+    dispatcher = AsyncQueueDispatcher(maxsize=1)
+    tick = _tick()
+    await dispatcher.dispatch(tick)
+    assert dispatcher.is_full() is True
+
+    with caplog.at_level(logging.ERROR):
+        await dispatcher.dispatch(tick)
+
+    assert dispatcher.dropped_tick_count == 1
+    assert "Consumer too slow" in caplog.text
+    assert "BTCUSDT" not in caplog.text
+    assert "B" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_dispatcher_wait_for_next_tick_rejects_non_trade_tick():
+    dispatcher = AsyncQueueDispatcher()
+    await dispatcher.__dict__["_AsyncQueueDispatcher__queue"].put("not-a-tick")
+    with pytest.raises(TypeError, match="Invariant violation: expected TradeTick"):
+        await dispatcher.wait_for_next_tick()
+
+
+@pytest.mark.asyncio
+async def test_dispatcher_dropped_tick_count_accumulates():
+    dispatcher = AsyncQueueDispatcher(maxsize=1)
+    tick = _tick()
+    await dispatcher.dispatch(tick)
+
+    for _ in range(3):
+        await dispatcher.dispatch(tick)
+
+    assert dispatcher.dropped_tick_count == 3

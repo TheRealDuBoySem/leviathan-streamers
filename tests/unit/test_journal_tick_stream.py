@@ -6,7 +6,7 @@ import pytest
 from core.interfaces.base import IPriceObserver
 from leviathan_common.models.trade_tick import TradeTick
 from core.journal.tick_journal import TickJournal, TickJournalCursor
-from core.journal.journal_tick_stream import JournalTickStream
+from core.journal.journal_tick_stream import JournalStreamFatalError, JournalTickStream
 
 
 def _tick(trade_id: str, ts: int = 1000) -> TradeTick:
@@ -20,6 +20,17 @@ def _tick(trade_id: str, ts: int = 1000) -> TradeTick:
     )
 
 
+async def _run_stream(stream: JournalTickStream):
+    task = asyncio.create_task(stream.start_streaming())
+    await asyncio.sleep(0)
+    return task
+
+
+async def _stop_stream(stream: JournalTickStream, task: asyncio.Task) -> None:
+    await stream.stop()
+    await task
+
+
 @pytest.mark.asyncio
 async def test_journal_tick_stream_replays_and_follows(tmp_path):
     journal = TickJournal(str(tmp_path))
@@ -27,7 +38,7 @@ async def test_journal_tick_stream_replays_and_follows(tmp_path):
     journal.append(_tick("t2", ts=1100))
 
     stream = JournalTickStream(journal, poll_interval_seconds=0.01, symbols=["BTCUSDT"])
-    await stream.start_streaming()
+    stream_task = await _run_stream(stream)
 
     first = await stream.wait_for_next_tick()
     assert first.trade_id == "t1"
@@ -44,7 +55,7 @@ async def test_journal_tick_stream_replays_and_follows(tmp_path):
     third = await stream.wait_for_next_tick()
     assert third.trade_id == "t3"
 
-    await stream.stop()
+    await _stop_stream(stream, stream_task)
 
 
 @pytest.mark.asyncio
@@ -55,11 +66,11 @@ async def test_journal_tick_stream_resumes_from_cursor(tmp_path):
     journal.append(_tick("t2", ts=1100))
 
     stream = JournalTickStream(journal, poll_interval_seconds=0.01)
-    await stream.start_streaming()
+    stream_task = await _run_stream(stream)
 
     tick = await stream.wait_for_next_tick()
     assert tick.trade_id == "t2"
-    await stream.stop()
+    await _stop_stream(stream, stream_task)
 
 
 @pytest.mark.asyncio
@@ -70,13 +81,13 @@ async def test_journal_tick_stream_notifies_attached_observers(tmp_path):
     observer = AsyncMock(spec=IPriceObserver)
     stream = JournalTickStream(journal, poll_interval_seconds=0.01)
     stream.attach_observer(observer)
-    await stream.start_streaming()
+    stream_task = await _run_stream(stream)
 
     tick = await stream.wait_for_next_tick()
     assert tick.trade_id == "t1"
     observer.on_price_update.assert_awaited_once_with(tick)
 
-    await stream.stop()
+    await _stop_stream(stream, stream_task)
 
 
 def test_journal_tick_stream_mark_without_pending_raises(tmp_path):

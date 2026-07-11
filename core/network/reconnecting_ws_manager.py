@@ -1,8 +1,14 @@
+from __future__ import annotations
+
 import asyncio
+import inspect
 import logging
+import sys
+from typing import Any, Optional, AsyncGenerator, Callable, Awaitable, Dict
+
 import websockets
 from websockets.exceptions import ConnectionClosed
-from typing import Optional, AsyncGenerator, Callable, Awaitable
+
 from core.interfaces.base import IRetryPolicy, IWatchdog, IHeartbeat
 
 logger = logging.getLogger(__name__)
@@ -12,25 +18,29 @@ _HEALTH_CHECK_INTERVAL_SECONDS = 5.0
 
 class MaxRetriesExceededError(Exception):
     """Raised when the maximum number of retry attempts is exceeded."""
+
     pass
 
 
 class ReconnectingWebSocketManager:
     """
     Manages a resilient WebSocket connection with automatic reconnection.
-    
+
+    Pattern: Factory (create_default) + Strategy (IRetryPolicy, IWatchdog, IHeartbeat).
+
     Invariants:
         - retry_policy, watchdog, and keep_alive are non-null.
     """
+
     @classmethod
     def create_default(
-        cls, 
-        url: str, 
-        max_retries: Optional[int] = None, 
-        timeout_seconds: int = 60, 
-        keep_alive_interval: int = 30,
+        cls,
+        url: str,
+        max_retries: Optional[int] = None,
+        timeout_seconds: float = 60.0,
+        keep_alive_interval: float = 30.0,
         keep_alive_payload: str = "ping",
-        connect_timeout: float = 10.0
+        connect_timeout: float = 10.0,
     ) -> "ReconnectingWebSocketManager":
         """Factory method to create a manager with standard resilient configuration."""
         if not isinstance(url, str):
@@ -40,12 +50,20 @@ class ReconnectingWebSocketManager:
         if max_retries is not None:
             if not isinstance(max_retries, int):
                 raise TypeError("max_retries must be an integer")
-        if not isinstance(timeout_seconds, int):
-            raise TypeError("timeout_seconds must be an integer")
-        if not isinstance(keep_alive_interval, int):
-            raise TypeError("keep_alive_interval must be an integer")
+            if max_retries < 0:
+                raise ValueError("max_retries must be >= 0")
+        if not isinstance(timeout_seconds, (int, float)):
+            raise TypeError("timeout_seconds must be a number (int or float)")
+        if timeout_seconds <= 0:
+            raise ValueError("timeout_seconds must be strictly positive")
+        if not isinstance(keep_alive_interval, (int, float)):
+            raise TypeError("keep_alive_interval must be a number (int or float)")
+        if keep_alive_interval <= 0:
+            raise ValueError("keep_alive_interval must be strictly positive")
         if not isinstance(keep_alive_payload, str):
             raise TypeError("keep_alive_payload must be a string")
+        if not keep_alive_payload:
+            raise ValueError("keep_alive_payload cannot be empty")
         if not isinstance(connect_timeout, (int, float)):
             raise TypeError("connect_timeout must be a float or integer")
         if connect_timeout <= 0:
@@ -54,13 +72,16 @@ class ReconnectingWebSocketManager:
         from core.network.retry_policy import RetryPolicy
         from core.network.silence_watchdog import SilenceWatchdog
         from core.network.keep_alive_emitter import KeepAliveEmitter
-        
+
         return cls(
             url=url,
             retry_policy=RetryPolicy(max_retries=max_retries),
             watchdog=SilenceWatchdog(timeout_seconds=timeout_seconds),
-            keep_alive=KeepAliveEmitter(interval_seconds=keep_alive_interval, payload=keep_alive_payload),
-            connect_timeout=connect_timeout
+            keep_alive=KeepAliveEmitter(
+                interval_seconds=keep_alive_interval,
+                payload=keep_alive_payload,
+            ),
+            connect_timeout=connect_timeout,
         )
 
     def __init__(
@@ -69,11 +90,11 @@ class ReconnectingWebSocketManager:
         retry_policy: IRetryPolicy,
         watchdog: IWatchdog,
         keep_alive: IHeartbeat,
-        connect_timeout: float = 10.0
+        connect_timeout: float = 10.0,
     ):
         """
         Initialize the manager.
-        
+
         Preconditions:
             - url must be a valid non-empty string.
             - retry_policy, watchdog, and keep_alive must be valid instances.
@@ -92,15 +113,16 @@ class ReconnectingWebSocketManager:
             raise TypeError("connect_timeout must be a float or integer")
         if connect_timeout <= 0:
             raise ValueError("connect_timeout must be strictly positive")
-            
+
         self.__url = url
         self.__retry_policy = retry_policy
         self.__watchdog = watchdog
         self.__keep_alive = keep_alive
         self.__connect_timeout = float(connect_timeout)
-        self.__ws: Optional[websockets.WebSocketClientProtocol] = None
+        self.__ws: Optional[Any] = None
         self.__stop_event = asyncio.Event()
         self.__on_connect_callback: Optional[Callable[[], Awaitable[None]]] = None
+        self.__health_task: Optional[asyncio.Task] = None
         self.__keep_alive_task: Optional[asyncio.Task] = None
 
     @property
@@ -131,12 +153,14 @@ class ReconnectingWebSocketManager:
     def set_on_connect_callback(self, callback: Callable[[], Awaitable[None]]) -> None:
         """
         Set a callback to be executed upon successful connection.
-        
+
         Preconditions:
-            - callback must be callable.
+            - callback must be an async callable.
         """
         if not callable(callback):
             raise TypeError("callback must be callable")
+        if not inspect.iscoroutinefunction(callback):
+            raise TypeError("callback must be an async function")
         self.__on_connect_callback = callback
 
     def is_stopped(self) -> bool:
@@ -147,19 +171,43 @@ class ReconnectingWebSocketManager:
         """Return True if the WebSocket connection is currently active."""
         if self.__ws is None:
             return False
-        if hasattr(self.__ws, "state"):
-            from websockets.protocol import State
-            return self.__ws.state == State.OPEN
-        if hasattr(self.__ws, "open"):
-            return bool(self.__ws.open)
-        if hasattr(self.__ws, "closed"):
-            return not self.__ws.closed
-        return False
+        return self.__is_websocket_open(self.__ws)
+
+    def get_status_report(self) -> Dict[str, object]:
+        """Return a snapshot of the manager connection state."""
+        return {
+            "url": self.__url,
+            "is_connected": self.is_connected(),
+            "is_stopped": self.is_stopped(),
+            "connect_timeout": self.__connect_timeout,
+        }
+
+    async def wait_until_connected(self, poll_interval: float = 0.1) -> None:
+        """
+        Wait until the WebSocket connection is active.
+
+        Preconditions:
+            - poll_interval must be strictly positive.
+
+        Raises:
+            ConnectionError: if the manager stops before a connection is established.
+        """
+        if not isinstance(poll_interval, (int, float)):
+            raise TypeError("poll_interval must be a number (int or float)")
+        if poll_interval <= 0:
+            raise ValueError("poll_interval must be strictly positive")
+
+        while not self.is_connected():
+            if self.is_stopped():
+                raise ConnectionError(
+                    "Manager stopped before connection was established."
+                )
+            await asyncio.sleep(poll_interval)
 
     async def send(self, message: str) -> None:
         """
         Send a message over the WebSocket.
-        
+
         Preconditions:
             - message must be a non-empty string.
         """
@@ -179,21 +227,58 @@ class ReconnectingWebSocketManager:
             self.__ws = None
 
     async def stop(self) -> None:
-        """Stop the manager and close any active connection."""
+        """Stop the manager, cancel background tasks, and close any active connection."""
         self.__stop_event.set()
+        await self.__cancel_background_task(self.__health_task)
+        await self.__cancel_background_task(self.__keep_alive_task)
+        self.__health_task = None
+        self.__keep_alive_task = None
         await self.disconnect()
+
+    def __is_websocket_open(self, ws: Any) -> bool:
+        """Evaluate whether a websocket client reports an open session."""
+        if hasattr(ws, "state"):
+            from websockets.protocol import State
+
+            return ws.state == State.OPEN
+        if hasattr(ws, "open"):
+            return bool(ws.open)
+        if hasattr(ws, "closed"):
+            return not ws.closed
+        return False
+
+    async def __open_websocket_connection(
+        self,
+    ) -> tuple[Any, Any]:
+        """Open a WebSocket session, applying connect_timeout to the handshake."""
+        connect_ctx = websockets.connect(self.__url, ping_interval=None)
+        try:
+            ws = await asyncio.wait_for(
+                connect_ctx.__aenter__(),
+                timeout=self.__connect_timeout,
+            )
+        except Exception:
+            await connect_ctx.__aexit__(*sys.exc_info())
+            raise
+        return connect_ctx, ws
+
+    async def __close_websocket_connection(self, connect_ctx: Any) -> None:
+        """Exit a websockets.connect context manager."""
+        await connect_ctx.__aexit__(None, None, None)
 
     async def __health_loop(self) -> None:
         """Internal loop to monitor connection health via the watchdog."""
         try:
-            while not self.__stop_event.is_set(): # pragma: no cover
+            while not self.__stop_event.is_set():  # pragma: no cover
                 await asyncio.sleep(_HEALTH_CHECK_INTERVAL_SECONDS)
-                if not self.__watchdog.check_health(): # pragma: no cover
-                    logger.error("Watchdog: Délai dépassé. Coupure de la connexion forcée.")
+                if not self.__watchdog.check_health():  # pragma: no cover
+                    logger.error(
+                        "Watchdog: Délai dépassé. Coupure de la connexion forcée."
+                    )
                     await self.__cancel_background_task(self.__keep_alive_task)
                     await self.disconnect()
                     break
-        except asyncio.CancelledError: # pragma: no cover
+        except asyncio.CancelledError:  # pragma: no cover
             pass
 
     async def __cancel_background_task(self, task: Optional[asyncio.Task]) -> None:
@@ -210,7 +295,7 @@ class ReconnectingWebSocketManager:
     async def start_connection_and_listen(self) -> AsyncGenerator[str, None]:
         """
         Connect to the WebSocket and yield incoming messages.
-        
+
         This method handles reconnection logic according to the retry policy.
         """
         attempt = 0
@@ -222,39 +307,48 @@ class ReconnectingWebSocketManager:
                 raise MaxRetriesExceededError("Connexion impossible.")
 
             logger.info(f"Connexion à {self.__url} (Tentative {attempt + 1})...")
+            connect_ctx = None
             health_task = None
             keep_alive_task = None
 
             try:
-                connect_ctx = websockets.connect(self.__url, ping_interval=None)
-                ws = await asyncio.wait_for(connect_ctx.__aenter__(), timeout=self.__connect_timeout)
+                connect_ctx, ws = await self.__open_websocket_connection()
                 try:
                     self.__ws = ws
                     logger.info("WebSocket connecté avec succès.")
+                    logger.debug(
+                        "WebSocket session started url=%s",
+                        self.__url,
+                    )
                     attempt = 0
                     self.__watchdog.ping()
-                    
+
                     health_task = asyncio.create_task(self.__health_loop())
-                    keep_alive_task = asyncio.create_task(self.__keep_alive.run(self.send))
+                    keep_alive_task = asyncio.create_task(
+                        self.__keep_alive.run(self.send)
+                    )
+                    self.__health_task = health_task
                     self.__keep_alive_task = keep_alive_task
-                    
+
                     if self.__on_connect_callback:
                         await self.__on_connect_callback()
-                    
+
                     async for message in ws:
                         self.__watchdog.ping()
                         yield message
                 finally:
-                    await connect_ctx.__aexit__(None, None, None)
+                    await self.__close_websocket_connection(connect_ctx)
             except ConnectionClosed as e:
                 rcvd = getattr(e, "rcvd", None)
                 close_code = rcvd.code if rcvd is not None else "Unknown"
                 logger.warning(f"WebSocket fermé ({close_code}).")  # pragma: no cover
+                logger.debug("WebSocket connection closed; preparing reconnect")
             except Exception as e:
                 logger.error(f"Erreur réseau: {e}")
             finally:
                 await self.__cancel_background_task(health_task)
                 await self.__cancel_background_task(keep_alive_task)
+                self.__health_task = None
                 self.__keep_alive_task = None
                 self.__ws = None
 
