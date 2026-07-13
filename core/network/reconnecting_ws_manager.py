@@ -14,6 +14,41 @@ from core.interfaces.base import IRetryPolicy, IWatchdog, IHeartbeat
 logger = logging.getLogger(__name__)
 
 _HEALTH_CHECK_INTERVAL_SECONDS = 5.0
+_ABSENT_CLOSE_DIAGNOSTIC = "close code/reason absent"
+
+
+def _normalize_close_reason(reason: Any) -> str:
+    """Normalize a WebSocket close reason to a UTF-8 string."""
+    if reason is None:
+        return ""
+    if isinstance(reason, bytes):
+        return reason.decode("utf-8", errors="replace")
+    return str(reason)
+
+
+def _format_close_frame(frame: Any, *, source: str) -> str:
+    """Format a single close frame (rcvd or sent) for diagnostics."""
+    code = getattr(frame, "code", None)
+    reason = _normalize_close_reason(getattr(frame, "reason", None))
+    code_label = str(code) if code is not None else "absent"
+    return f"code={code_label}, reason={reason!r}, frame={source}"
+
+
+def format_websocket_close_diagnostic(exc: Any) -> str:
+    """
+    Build a clear close diagnostic from a ConnectionClosed-like exception.
+
+    Prefers the received close frame, then the sent close frame.
+    When neither frame is available, returns an explicit absence label
+    instead of an opaque sentinel such as ``Unknown``.
+    """
+    rcvd = getattr(exc, "rcvd", None)
+    if rcvd is not None:
+        return _format_close_frame(rcvd, source="rcvd")
+    sent = getattr(exc, "sent", None)
+    if sent is not None:
+        return _format_close_frame(sent, source="sent")
+    return _ABSENT_CLOSE_DIAGNOSTIC
 
 
 class MaxRetriesExceededError(Exception):
@@ -339,9 +374,8 @@ class ReconnectingWebSocketManager:
                 finally:
                     await self.__close_websocket_connection(connect_ctx)
             except ConnectionClosed as e:
-                rcvd = getattr(e, "rcvd", None)
-                close_code = rcvd.code if rcvd is not None else "Unknown"
-                logger.warning(f"WebSocket fermé ({close_code}).")  # pragma: no cover
+                diagnostic = format_websocket_close_diagnostic(e)
+                logger.warning("WebSocket fermé (%s).", diagnostic)
                 logger.debug("WebSocket connection closed; preparing reconnect")
             except Exception as e:
                 logger.error(f"Erreur réseau: {e}")

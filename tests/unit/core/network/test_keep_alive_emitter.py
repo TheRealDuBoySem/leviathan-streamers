@@ -1,38 +1,74 @@
-import pytest
 import asyncio
+
+import pytest
+
 from core.network.keep_alive_emitter import KeepAliveEmitter
 
+
+async def _run_until_first_send(emitter, mock_send, monkeypatch, *, run_payload=None):
+    """Drive KeepAliveEmitter without depending on wall-clock timing."""
+    sent = asyncio.Event()
+    real_sleep = asyncio.sleep
+    task_holder: dict[str, asyncio.Task] = {}
+
+    async def tracking_send(payload: str) -> None:
+        await mock_send(payload)
+        if not sent.is_set():
+            sent.set()
+            task = task_holder.get("task")
+            if task is not None:
+                task.cancel()
+
+    async def immediate_sleep(_seconds: float) -> None:
+        # Yield once without waiting the keep-alive interval.
+        await real_sleep(0)
+
+    monkeypatch.setattr(
+        "core.network.keep_alive_emitter.asyncio.sleep",
+        immediate_sleep,
+    )
+    task = asyncio.create_task(emitter.run(tracking_send, run_payload))
+    task_holder["task"] = task
+    await asyncio.wait_for(sent.wait(), timeout=1.0)
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+
 @pytest.mark.asyncio
-async def test_keep_alive():
+async def test_keep_alive(monkeypatch):
     emitter = KeepAliveEmitter(interval_seconds=0.01)
     called = []
-    async def mock_send(p): called.append(p)
-    task = asyncio.create_task(emitter.run(mock_send, "p"))
-    await asyncio.sleep(0.02)
-    task.cancel()
-    assert len(called) >= 1
+
+    async def mock_send(p):
+        called.append(p)
+
+    await _run_until_first_send(emitter, mock_send, monkeypatch, run_payload="p")
+    assert called == ["p"]
+
 
 @pytest.mark.asyncio
 async def test_keep_alive_contracts():
     """Verify Design by Contract preconditions for KeepAliveEmitter."""
     with pytest.raises(ValueError, match="interval_seconds must be positive"):
         KeepAliveEmitter(interval_seconds=0)
-    
+
     e = KeepAliveEmitter()
     with pytest.raises(TypeError, match="send_func must be callable"):
         await e.run(None)
     with pytest.raises(ValueError, match="payload cannot be empty"):
         await e.run(lambda x: x, payload="")
 
+
 @pytest.mark.asyncio
 async def test_keep_alive_emitter_types():
     """Verify Type contract preconditions for KeepAliveEmitter."""
     with pytest.raises(TypeError, match="interval_seconds must be a number"):
         KeepAliveEmitter(interval_seconds="30")
-    
+
     e = KeepAliveEmitter()
     with pytest.raises(TypeError, match="payload must be a string"):
         await e.run(lambda x: x, payload=123)
+
 
 def test_keep_alive_emitter_properties():
     """Verify properties of KeepAliveEmitter."""
@@ -42,7 +78,7 @@ def test_keep_alive_emitter_properties():
 
     e_float = KeepAliveEmitter(interval_seconds=0.5)
     assert e_float.interval_seconds == 0.5
-    
+
     with pytest.raises(AttributeError):
         e.interval_seconds = 10
     with pytest.raises(AttributeError):
@@ -67,13 +103,12 @@ async def test_keep_alive_cancellation_propagates():
 
 
 @pytest.mark.asyncio
-async def test_keep_alive_default_payload():
+async def test_keep_alive_default_payload(monkeypatch):
     emitter = KeepAliveEmitter(interval_seconds=0.01, payload="configured_ping")
     called = []
-    async def mock_send(p): called.append(p)
-    task = asyncio.create_task(emitter.run(mock_send))
-    await asyncio.sleep(0.02)
-    task.cancel()
-    assert len(called) >= 1
-    assert called[0] == "configured_ping"
 
+    async def mock_send(p):
+        called.append(p)
+
+    await _run_until_first_send(emitter, mock_send, monkeypatch)
+    assert called == ["configured_ping"]

@@ -25,6 +25,10 @@ def test_system_message_invariants():
     msg = SystemMessage(event="subscribe", msg="Success")
     assert msg.event == "subscribe"
     assert msg.msg == "Success"
+    assert msg.symbol is None
+
+    msg_with_symbol = SystemMessage(event="subscribe", msg="ok", symbol="XRPUSDT")
+    assert msg_with_symbol.symbol == "XRPUSDT"
 
     # Value error for empty event
     with pytest.raises(ValueError, match="event ne peut pas être vide"):
@@ -33,6 +37,11 @@ def test_system_message_invariants():
     # Type error for non-string msg
     with pytest.raises(TypeError, match="msg doit être une chaîne de caractères"):
         SystemMessage(event="subscribe", msg=123)
+
+    with pytest.raises(TypeError, match="symbol must be a string when provided"):
+        SystemMessage(event="subscribe", msg="ok", symbol=123)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="symbol cannot be empty when provided"):
+        SystemMessage(event="subscribe", msg="ok", symbol="")
 
 def test_error_message_invariants():
     # Valid error message

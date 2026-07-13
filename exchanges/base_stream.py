@@ -7,6 +7,10 @@ from typing import Optional, List, AsyncIterator, Callable, Awaitable
 from core.models.trade_tick import TradeTick
 from core.models.messages import TradeMessage, SystemMessage, ErrorMessage
 from core.state.subscription_registry import SubscriptionRegistry
+from core.state.subscription_confirmation_tracker import (
+    DEFAULT_CONFIRMATION_TIMEOUT_SECONDS,
+    SubscriptionConfirmationTracker,
+)
 from core.network.reconnecting_ws_manager import ReconnectingWebSocketManager
 from core.interfaces.base import (
     IExchangeStream,
@@ -89,6 +93,7 @@ class BaseExchangeStream(IExchangeStream, ABC):
         parsing_strategy: IParsingStrategy,
         dispatch_strategy: IDispatchStrategy,
         symbols: Optional[List[str]] = None,
+        confirmation_timeout_seconds: float = DEFAULT_CONFIRMATION_TIMEOUT_SECONDS,
     ):
         _validate_network_manager(network_manager)
         if not isinstance(subscription_strategy, ISubscriptionStrategy):
@@ -107,6 +112,9 @@ class BaseExchangeStream(IExchangeStream, ABC):
         self.__network_manager = network_manager
         self.__observers: List[IPriceObserver] = []
         self.__on_reconnect_callbacks: List[Callable[[], Awaitable[None]]] = []
+        self.__confirmation_tracker = SubscriptionConfirmationTracker(
+            timeout_seconds=confirmation_timeout_seconds,
+        )
 
         self.__network_manager.set_on_connect_callback(self.__handle_connect)
 
@@ -172,6 +180,11 @@ class BaseExchangeStream(IExchangeStream, ABC):
         """Return a copy of the attached observers list."""
         return list(self.__observers)
 
+    @property
+    def confirmation_tracker(self) -> SubscriptionConfirmationTracker:
+        """Return the subscription confirmation tracker (reconnect acks)."""
+        return self.__confirmation_tracker
+
     # Pattern: Observer (Observable part)
     def attach_observer(self, observer: IPriceObserver) -> None:
         if not isinstance(observer, IPriceObserver):
@@ -236,6 +249,10 @@ class BaseExchangeStream(IExchangeStream, ABC):
                         await self.__notify_observers(tick)
 
                 elif isinstance(parsed_message, SystemMessage):
+                    if parsed_message.event == "subscribe" and parsed_message.symbol:
+                        self.__confirmation_tracker.record_confirmation(
+                            parsed_message.symbol
+                        )
                     if parsed_message.event != "pong":
                         logger.info(parsed_message.msg)
 
@@ -252,6 +269,7 @@ class BaseExchangeStream(IExchangeStream, ABC):
                 continue
 
     async def stop(self) -> None:
+        self.__confirmation_tracker.cancel()
         await self.__network_manager.stop()
 
     async def _resubscribe_all(self) -> None:
@@ -259,7 +277,15 @@ class BaseExchangeStream(IExchangeStream, ABC):
         symbols = self.get_active_symbols()
         if symbols:
             await self.__send_subscribe_payload(symbols)
-            logger.info("Requête globale d'abonnement envoyée pour %s.", self.__class__.__name__)
+            requested = sorted(symbols)
+            logger.info(
+                "Requête globale d'abonnement envoyée pour %s: symboles demandés=%s",
+                self.__class__.__name__,
+                requested,
+            )
+            self.__confirmation_tracker.begin_expectation(requested)
+        else:
+            self.__confirmation_tracker.cancel()
 
     async def __send_subscribe_payload(self, symbols: List[str]) -> None:
         payload = self.__subscription_strategy.format_subscribe(symbols)

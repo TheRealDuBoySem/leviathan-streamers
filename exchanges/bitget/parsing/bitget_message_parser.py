@@ -85,7 +85,17 @@ class BitgetMessageParser(IParsingStrategy):
             if event_type == BitgetEventClassifier.TRADE:
                 return TradeMessage(ticks=self.__trade_mapper.map(data)) # pragma: no cover
             elif event_type == BitgetEventClassifier.SUBSCRIBE:
-                return SystemMessage(event="subscribe", msg=f"Abonnement confirmé: {data.get('arg')}")
+                symbol = self.__extract_ack_symbol(data.get("arg"))
+                if symbol:
+                    return SystemMessage(
+                        event="subscribe",
+                        msg=f"Abonnement confirmé: {symbol}",
+                        symbol=symbol,
+                    )
+                return SystemMessage(
+                    event="subscribe",
+                    msg=f"Abonnement confirmé: {data.get('arg')}",
+                )
             elif event_type == BitgetEventClassifier.ERROR:
                 return ErrorMessage(msg=f"Erreur Bitget: {data}")
             
@@ -96,4 +106,13 @@ class BitgetMessageParser(IParsingStrategy):
             raise
         except Exception as e:
             logger.error(f"Erreur inattendue de parsing: {e}")
+        return None
+
+    @staticmethod
+    def __extract_ack_symbol(arg) -> Optional[str]:
+        """Extract instId from a Bitget subscribe acknowledgement arg."""
+        if isinstance(arg, dict):
+            inst_id = arg.get("instId")
+            if isinstance(inst_id, str) and inst_id:
+                return inst_id
         return None

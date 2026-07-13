@@ -489,6 +489,7 @@ def test_base_stream_properties(stream):
     assert stream.parsing_strategy is not None
     assert stream.dispatch_strategy is not None
     assert stream.network_manager is not None
+    assert stream.confirmation_tracker is not None
     assert isinstance(stream.observers, list)
     
     with pytest.raises(AttributeError):
@@ -503,6 +504,8 @@ def test_base_stream_properties(stream):
         stream.network_manager = None
     with pytest.raises(AttributeError):
         stream.observers = None
+    with pytest.raises(AttributeError):
+        stream.confirmation_tracker = None
 
 @pytest.mark.asyncio
 async def test_wait_until_connected(mocker, stream):
@@ -684,6 +687,184 @@ def test_bitget_stream_rejects_network_manager_without_streaming_contract(mock_p
             parsing_strategy=mock_parser,
             dispatch_strategy=AsyncQueueDispatcher(),
         )
+
+
+@pytest.mark.asyncio
+async def test_resubscribe_logs_requested_symbols_and_tracks_confirmations(
+    mocker, mock_ws_manager, mock_parser, caplog
+):
+    """After reconnect, requested symbols are logged and confirmations tracked."""
+    import logging
+
+    captured, original = _capture_on_connect_callback(mock_ws_manager)
+    stream = BitgetTickStream(
+        network_manager=mock_ws_manager,
+        subscription_strategy=BitgetSubscriptionProtocol(inst_type="mc"),
+        parsing_strategy=mock_parser,
+        dispatch_strategy=AsyncQueueDispatcher(),
+        symbols=["BTCUSDT", "ETHUSDT", "XRPUSDT"],
+        confirmation_timeout_seconds=0.05,
+    )
+    mock_ws_manager.set_on_connect_callback = original
+    mocker.patch(
+        "core.network.reconnecting_ws_manager.ReconnectingWebSocketManager.send",
+        new_callable=AsyncMock,
+    )
+
+    with caplog.at_level(logging.INFO):
+        await captured[0]()
+
+    assert any(
+        "Requête globale d'abonnement" in record.message
+        and "BTCUSDT" in record.message
+        and "ETHUSDT" in record.message
+        and "XRPUSDT" in record.message
+        for record in caplog.records
+    )
+    assert set(stream.confirmation_tracker.get_expected_symbols()) == {
+        "BTCUSDT",
+        "ETHUSDT",
+        "XRPUSDT",
+    }
+
+
+@pytest.mark.asyncio
+async def test_start_streaming_records_subscribe_acks_and_warns_on_partial(
+    mocker, mock_ws_manager, mock_parser, caplog
+):
+    """Partial confirmations after reconnect produce an explicit WARNING."""
+    import logging
+
+    captured, original = _capture_on_connect_callback(mock_ws_manager)
+    stream = BitgetTickStream(
+        network_manager=mock_ws_manager,
+        subscription_strategy=BitgetSubscriptionProtocol(inst_type="mc"),
+        parsing_strategy=mock_parser,
+        dispatch_strategy=AsyncQueueDispatcher(),
+        symbols=["BTCUSDT", "ETHUSDT", "XRPUSDT"],
+        confirmation_timeout_seconds=0.08,
+    )
+    mock_ws_manager.set_on_connect_callback = original
+    mocker.patch(
+        "core.network.reconnecting_ws_manager.ReconnectingWebSocketManager.send",
+        new_callable=AsyncMock,
+    )
+    await captured[0]()
+
+    async def mock_listen():
+        yield orjson_subscribe_ack("XRPUSDT")
+        await asyncio.sleep(0.12)
+
+    mocker.patch.object(
+        stream.network_manager,
+        "start_connection_and_listen",
+        side_effect=mock_listen,
+    )
+
+    with caplog.at_level(logging.WARNING):
+        await stream.start_streaming()
+
+    assert any(
+        "Confirmation partielle d'abonnement" in record.message
+        and "XRPUSDT" in record.message
+        and "BTCUSDT" in record.message
+        and "ETHUSDT" in record.message
+        for record in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_start_streaming_logs_full_confirmation_after_reconnect(
+    mocker, mock_ws_manager, mock_parser, caplog
+):
+    """All acks before timeout log requested vs confirmed as complete."""
+    import logging
+
+    captured, original = _capture_on_connect_callback(mock_ws_manager)
+    stream = BitgetTickStream(
+        network_manager=mock_ws_manager,
+        subscription_strategy=BitgetSubscriptionProtocol(inst_type="mc"),
+        parsing_strategy=mock_parser,
+        dispatch_strategy=AsyncQueueDispatcher(),
+        symbols=["BTCUSDT", "XRPUSDT"],
+        confirmation_timeout_seconds=1.0,
+    )
+    mock_ws_manager.set_on_connect_callback = original
+    mocker.patch(
+        "core.network.reconnecting_ws_manager.ReconnectingWebSocketManager.send",
+        new_callable=AsyncMock,
+    )
+    await captured[0]()
+
+    async def mock_listen():
+        yield orjson_subscribe_ack("BTCUSDT")
+        yield orjson_subscribe_ack("XRPUSDT")
+
+    mocker.patch.object(
+        stream.network_manager,
+        "start_connection_and_listen",
+        side_effect=mock_listen,
+    )
+
+    with caplog.at_level(logging.INFO):
+        await stream.start_streaming()
+
+    assert any(
+        "Abonnements confirmés après reconnect" in record.message
+        and "BTCUSDT" in record.message
+        and "XRPUSDT" in record.message
+        for record in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_stop_cancels_pending_confirmation_watchdog(
+    mocker, mock_ws_manager, mock_parser, caplog
+):
+    import logging
+
+    captured, original = _capture_on_connect_callback(mock_ws_manager)
+    stream = BitgetTickStream(
+        network_manager=mock_ws_manager,
+        subscription_strategy=BitgetSubscriptionProtocol(inst_type="mc"),
+        parsing_strategy=mock_parser,
+        dispatch_strategy=AsyncQueueDispatcher(),
+        symbols=["BTCUSDT"],
+        confirmation_timeout_seconds=0.2,
+    )
+    mock_ws_manager.set_on_connect_callback = original
+    mocker.patch(
+        "core.network.reconnecting_ws_manager.ReconnectingWebSocketManager.send",
+        new_callable=AsyncMock,
+    )
+    mock_stop = mocker.patch(
+        "core.network.reconnecting_ws_manager.ReconnectingWebSocketManager.stop",
+        new_callable=AsyncMock,
+    )
+    await captured[0]()
+    assert stream.confirmation_tracker.is_expectation_active()
+
+    with caplog.at_level(logging.WARNING):
+        await stream.stop()
+        await asyncio.sleep(0.25)
+
+    mock_stop.assert_awaited_once()
+    assert not any(
+        "Confirmation partielle d'abonnement" in record.message
+        for record in caplog.records
+    )
+    assert stream.confirmation_tracker.is_expectation_active() is False
+
+
+def orjson_subscribe_ack(symbol: str) -> str:
+    import orjson
+
+    return orjson.dumps(
+        {
+            "event": "subscribe",
+            "arg": {"instType": "mc", "channel": "trade", "instId": symbol},
+        }
+    ).decode("utf-8")
 
 
 @pytest.mark.asyncio

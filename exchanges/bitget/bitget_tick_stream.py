@@ -3,6 +3,9 @@ from typing import Optional, List
 from exchanges.base_stream import BaseExchangeStream
 from core.network.reconnecting_ws_manager import ReconnectingWebSocketManager
 from core.interfaces.base import ISubscriptionStrategy, IParsingStrategy, IDispatchStrategy
+from core.state.subscription_confirmation_tracker import (
+    DEFAULT_CONFIRMATION_TIMEOUT_SECONDS,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -20,13 +23,15 @@ class BitgetTickStream(BaseExchangeStream):
         subscription_strategy: ISubscriptionStrategy,
         parsing_strategy: IParsingStrategy,
         dispatch_strategy: IDispatchStrategy,
-        symbols: Optional[List[str]] = None
+        symbols: Optional[List[str]] = None,
+        confirmation_timeout_seconds: float = DEFAULT_CONFIRMATION_TIMEOUT_SECONDS,
     ):
         super().__init__(
             network_manager=network_manager,
             subscription_strategy=subscription_strategy,
             parsing_strategy=parsing_strategy,
             dispatch_strategy=dispatch_strategy,
-            symbols=symbols
+            symbols=symbols,
+            confirmation_timeout_seconds=confirmation_timeout_seconds,
         )
 

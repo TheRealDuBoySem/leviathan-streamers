@@ -7,6 +7,7 @@ Pattern: Repository — persists TradeTick records with monotonic sequence numbe
 from __future__ import annotations
 
 import json
+import logging
 import os
 import threading
 import time
@@ -17,16 +18,36 @@ from typing import Iterator, Optional
 from core.journal.journal_file_lock import JournalFileLock
 from leviathan_common.models.trade_tick import TradeTick
 
+logger = logging.getLogger(__name__)
+
 DEFAULT_DEDUP_WINDOW = 10_000
 SEQ_INDEX_INTERVAL = 500
 META_PERSIST_INTERVAL = 50
 COMPACT_MIN_LAG_SEQ = 5_000
+_INVALID_LINE_PREVIEW_CHARS = 120
 
 _TICK_JOURNAL_FILE = "tick_journal.jsonl"
 _TICK_JOURNAL_META_FILE = "tick_journal.meta.json"
 _TICK_JOURNAL_CURSOR_FILE = "tick_journal.cursor.json"
 _TICK_JOURNAL_LOCK_FILE = "tick_journal.lock"
+_TICK_JOURNAL_QUARANTINE_FILE = "tick_journal.quarantine.jsonl"
 _TICK_REQUIRED_FIELDS = ("inst_id", "ts", "price", "size", "side", "trade_id")
+
+
+def _should_log_invalid_line(skipped_count: int) -> bool:
+    """Rate-limit invalid-line warnings while keeping a rising counter visible."""
+    if skipped_count <= 3:
+        return True
+    if skipped_count in (10, 50, 100):
+        return True
+    return skipped_count % 500 == 0
+
+
+def _preview_journal_line(line: str) -> str:
+    preview = line.replace("\n", "\\n")
+    if len(preview) > _INVALID_LINE_PREVIEW_CHARS:
+        return preview[:_INVALID_LINE_PREVIEW_CHARS] + "..."
+    return preview
 
 
 def _atomic_write_json(path: str, payload: dict) -> None:
@@ -117,12 +138,18 @@ class _SymbolDedupBucket:
 
 
 class JournalIncrementalReader:
-    """Reads new journal records incrementally without rescanning the full file."""
+    """Reads new journal records incrementally without rescanning the full file.
+
+    Incomplete trailing lines (no newline yet) are left unread until complete.
+    Complete but invalid lines are quarantined and skipped so they cannot poison
+    the tail-follow loop or respawn retries.
+    """
 
     def __init__(self, journal: "TickJournal") -> None:
         self.__journal = journal
         self.__read_offset = 0
         self.__next_seq = 1
+        self.__skipped_invalid_lines = 0
 
     def reset_from_seq(self, start_seq: int) -> None:
         if not isinstance(start_seq, int) or start_seq < 0:
@@ -135,6 +162,40 @@ class JournalIncrementalReader:
             self.reset_from_seq(start_seq)
         return self.__read_new_records()
 
+    def __quarantine_invalid_line(self, line: str, reason: str) -> None:
+        self.__skipped_invalid_lines += 1
+        count = self.__skipped_invalid_lines
+        self.__journal.quarantine_line(line, reason=reason)
+        if _should_log_invalid_line(count):
+            logger.warning(
+                "JournalIncrementalReader skipped invalid journal line "
+                "(skipped_total=%s, offset=%s, reason=%s): %s",
+                count,
+                self.__read_offset,
+                reason,
+                _preview_journal_line(line),
+            )
+
+    def __parse_complete_line(self, line: str) -> Optional[tuple[int, TradeTick]]:
+        stripped = line.strip()
+        if not stripped:
+            return None
+        try:
+            record = json.loads(stripped)
+        except json.JSONDecodeError as exc:
+            self.__quarantine_invalid_line(stripped, reason=str(exc))
+            return None
+        if not isinstance(record, dict):
+            self.__quarantine_invalid_line(stripped, reason="record is not a JSON object")
+            return None
+        try:
+            seq = int(record["seq"])
+            tick = tick_from_dict(record["tick"])
+        except (KeyError, TypeError, ValueError) as exc:
+            self.__quarantine_invalid_line(stripped, reason=str(exc))
+            return None
+        return seq, tick
+
     def __read_new_records(self) -> list[tuple[int, TradeTick]]:
         journal_path = self.__journal.journal_path
         if not os.path.exists(journal_path):
@@ -146,18 +207,18 @@ class JournalIncrementalReader:
                 line = handle.readline()
                 if not line:
                     break
-                line = line.strip()
-                if not line:
-                    self.__read_offset = handle.tell()
-                    continue
-                record = json.loads(line)
-                seq = int(record["seq"])
-                if seq < self.__next_seq:
-                    self.__read_offset = handle.tell()
-                    continue
-                records.append((seq, tick_from_dict(record["tick"])))
-                self.__next_seq = seq + 1
+                # Incomplete trailing write: wait for a terminating newline.
+                if not line.endswith("\n"):
+                    break
+                parsed = self.__parse_complete_line(line)
                 self.__read_offset = handle.tell()
+                if parsed is None:
+                    continue
+                seq, tick = parsed
+                if seq < self.__next_seq:
+                    continue
+                records.append((seq, tick))
+                self.__next_seq = seq + 1
         return records
 
 
@@ -189,6 +250,7 @@ class TickJournal:
         self.__meta_path = os.path.join(normalized_dir, _TICK_JOURNAL_META_FILE)
         self.__cursor_path = os.path.join(normalized_dir, _TICK_JOURNAL_CURSOR_FILE)
         self.__lock_path = os.path.join(normalized_dir, _TICK_JOURNAL_LOCK_FILE)
+        self.__quarantine_path = os.path.join(normalized_dir, _TICK_JOURNAL_QUARANTINE_FILE)
         self.__dedup_window = dedup_window
         self.__seq_index_interval = seq_index_interval
         self.__thread_lock = threading.Lock()
@@ -205,8 +267,35 @@ class TickJournal:
     def cursor_path(self) -> str:
         return self.__cursor_path
 
+    @property
+    def quarantine_path(self) -> str:
+        return self.__quarantine_path
+
     def create_incremental_reader(self) -> JournalIncrementalReader:
         return JournalIncrementalReader(self)
+
+    def quarantine_line(self, line: str, *, reason: str) -> None:
+        """Append a rejected journal line for forensics without blocking the reader."""
+        if not isinstance(line, str):
+            raise TypeError("line must be a string")
+        if not isinstance(reason, str) or not reason.strip():
+            raise ValueError("reason must be a non-empty string")
+        payload = {
+            "ts_ms": int(time.time() * 1000),
+            "reason": reason.strip(),
+            "line": line,
+        }
+        encoded = json.dumps(payload, separators=(",", ":")) + "\n"
+        try:
+            with open(self.__quarantine_path, "a", encoding="utf-8") as handle:
+                handle.write(encoded)
+                handle.flush()
+        except OSError as exc:
+            logger.warning(
+                "Failed to quarantine invalid journal line (%s): %s",
+                reason.strip(),
+                exc,
+            )
 
     def __load_meta(self) -> dict:
         if not os.path.exists(self.__meta_path):
@@ -383,18 +472,31 @@ class TickJournal:
                     return 0
                 retained: list[str] = []
                 removed = 0
+                skipped_invalid = 0
                 with open(self.__journal_path, "r", encoding="utf-8") as handle:
                     for line in handle:
-                        line = line.strip()
-                        if not line:
+                        stripped = line.strip()
+                        if not stripped:
                             continue
-                        record = json.loads(line)
-                        seq = int(record["seq"])
+                        try:
+                            record = json.loads(stripped)
+                            seq = int(record["seq"])
+                        except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+                            skipped_invalid += 1
+                            self.quarantine_line(stripped, reason=f"compact_skip: {exc}")
+                            if _should_log_invalid_line(skipped_invalid):
+                                logger.warning(
+                                    "TickJournal compact skipped invalid journal line "
+                                    "(skipped_total=%s): %s",
+                                    skipped_invalid,
+                                    _preview_journal_line(stripped),
+                                )
+                            continue
                         if seq < min_retain_seq:
                             removed += 1
                             continue
                         retained.append(json.dumps(record, separators=(",", ":")))
-                if removed == 0:
+                if removed == 0 and skipped_invalid == 0:
                     return 0
                 temp_path = f"{self.__journal_path}.compact.tmp"
                 with open(temp_path, "w", encoding="utf-8") as handle:

@@ -280,6 +280,127 @@ async def test_listen_loop_connection_closed_exception():
     assert mgr.is_stopped() is True
 
 
+def test_format_websocket_close_diagnostic_from_rcvd_frame():
+    from websockets.exceptions import ConnectionClosed
+    from websockets.frames import Close
+    from core.network.reconnecting_ws_manager import format_websocket_close_diagnostic
+
+    exc = ConnectionClosed(Close(1000, "Normal Closure"), None)
+    assert format_websocket_close_diagnostic(exc) == (
+        "code=1000, reason='Normal Closure', frame=rcvd"
+    )
+
+
+def test_format_websocket_close_diagnostic_from_sent_frame_when_rcvd_absent():
+    from websockets.exceptions import ConnectionClosed
+    from websockets.frames import Close
+    from core.network.reconnecting_ws_manager import format_websocket_close_diagnostic
+
+    exc = ConnectionClosed(None, Close(1001, "going away"))
+    assert format_websocket_close_diagnostic(exc) == (
+        "code=1001, reason='going away', frame=sent"
+    )
+
+
+def test_format_websocket_close_diagnostic_prefers_rcvd_over_sent():
+    from websockets.exceptions import ConnectionClosed
+    from websockets.frames import Close
+    from core.network.reconnecting_ws_manager import format_websocket_close_diagnostic
+
+    exc = ConnectionClosed(Close(1000, "peer"), Close(1001, "local"), rcvd_then_sent=True)
+    assert format_websocket_close_diagnostic(exc) == (
+        "code=1000, reason='peer', frame=rcvd"
+    )
+
+
+def test_format_websocket_close_diagnostic_decodes_bytes_reason():
+    from core.network.reconnecting_ws_manager import format_websocket_close_diagnostic
+
+    class _Frame:
+        code = 1011
+        reason = b"server error"
+
+    class _Exc:
+        rcvd = _Frame()
+        sent = None
+
+    assert format_websocket_close_diagnostic(_Exc()) == (
+        "code=1011, reason='server error', frame=rcvd"
+    )
+
+
+def test_format_websocket_close_diagnostic_absent_frames():
+    from websockets.exceptions import ConnectionClosed
+    from core.network.reconnecting_ws_manager import (
+        _normalize_close_reason,
+        format_websocket_close_diagnostic,
+    )
+
+    assert _normalize_close_reason(None) == ""
+    assert format_websocket_close_diagnostic(ConnectionClosed(None, None)) == (
+        "close code/reason absent"
+    )
+    assert "Unknown" not in format_websocket_close_diagnostic(ConnectionClosed(None, None))
+
+
+@pytest.mark.asyncio
+async def test_connection_closed_logs_real_code_and_reason(caplog):
+    import logging
+    from websockets.exceptions import ConnectionClosed
+    from websockets.frames import Close
+
+    mgr = ReconnectingWebSocketManager(
+        "ws://t", RetryPolicy(max_retries=1), SilenceWatchdog(), KeepAliveEmitter()
+    )
+
+    class ClosedWithReasonWS(BaseMockWS):
+        async def __aiter__(self):
+            raise ConnectionClosed(Close(1008, "policy violation"), None)
+            yield  # pragma: no cover
+
+    with patch("websockets.connect", return_value=ClosedWithReasonWS()):
+        with caplog.at_level(logging.WARNING):
+            with pytest.raises(MaxRetriesExceededError):
+                async for _ in mgr.start_connection_and_listen():
+                    pass  # pragma: no cover
+
+    warning_text = " ".join(
+        r.message for r in caplog.records if r.levelno == logging.WARNING
+    )
+    assert "WebSocket fermé" in warning_text
+    assert "code=1008" in warning_text
+    assert "policy violation" in warning_text
+    assert "Unknown" not in warning_text
+
+
+@pytest.mark.asyncio
+async def test_connection_closed_logs_absent_when_no_close_frames(caplog):
+    import logging
+    from websockets.exceptions import ConnectionClosed
+
+    mgr = ReconnectingWebSocketManager(
+        "ws://t", RetryPolicy(max_retries=1), SilenceWatchdog(), KeepAliveEmitter()
+    )
+
+    class ClosedWithoutFramesWS(BaseMockWS):
+        async def __aiter__(self):
+            raise ConnectionClosed(None, None)
+            yield  # pragma: no cover
+
+    with patch("websockets.connect", return_value=ClosedWithoutFramesWS()):
+        with caplog.at_level(logging.WARNING):
+            with pytest.raises(MaxRetriesExceededError):
+                async for _ in mgr.start_connection_and_listen():
+                    pass  # pragma: no cover
+
+    warning_text = " ".join(
+        r.message for r in caplog.records if r.levelno == logging.WARNING
+    )
+    assert "WebSocket fermé" in warning_text
+    assert "close code/reason absent" in warning_text
+    assert "Unknown" not in warning_text
+
+
 @pytest.mark.asyncio
 async def test_reconnecting_ws_manager_connection_closed_code_and_await_cancel():
     from websockets.exceptions import ConnectionClosed

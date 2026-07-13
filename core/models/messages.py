@@ -1,4 +1,4 @@
-from typing import List
+from typing import List, Optional
 from dataclasses import dataclass
 from core.models.trade_tick import TradeTick
 
@@ -34,15 +34,22 @@ class SystemMessage(ParsedMessage):
     Invariants:
         - event est une chaîne non vide.
         - msg est une chaîne (éventuellement vide).
+        - symbol, when set, is a non-empty string (subscribe/unsubscribe ack).
     """
     event: str
     msg: str
+    symbol: Optional[str] = None
 
     def __post_init__(self):
         if not self.event:
             raise ValueError("event ne peut pas être vide")
         if not isinstance(self.msg, str):
             raise TypeError("msg doit être une chaîne de caractères")
+        if self.symbol is not None:
+            if not isinstance(self.symbol, str):
+                raise TypeError("symbol must be a string when provided")
+            if not self.symbol:
+                raise ValueError("symbol cannot be empty when provided")
 
 @dataclass(frozen=True)
 class ErrorMessage(ParsedMessage):

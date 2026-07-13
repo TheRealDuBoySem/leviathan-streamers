@@ -19,10 +19,26 @@ def test_parse_pong(parser):
     assert isinstance(res, SystemMessage)
 
 def test_parse_subscribe(mocker, parser):
-    mocker.patch('core.serialization.json_deserializer.JsonDeserializer.deserialize', return_value={"arg": "BTC"})
+    mocker.patch(
+        'core.serialization.json_deserializer.JsonDeserializer.deserialize',
+        return_value={"arg": {"instType": "mc", "channel": "trade", "instId": "XRPUSDT"}},
+    )
     mocker.patch('exchanges.bitget.parsing.bitget_event_classifier.BitgetEventClassifier.classify', return_value="subscribe")
     res = parser.parse("msg")
     assert res.event == "subscribe"
+    assert res.symbol == "XRPUSDT"
+    assert "XRPUSDT" in res.msg
+
+
+def test_parse_subscribe_without_inst_id(mocker, parser):
+    mocker.patch(
+        'core.serialization.json_deserializer.JsonDeserializer.deserialize',
+        return_value={"arg": "BTC"},
+    )
+    mocker.patch('exchanges.bitget.parsing.bitget_event_classifier.BitgetEventClassifier.classify', return_value="subscribe")
+    res = parser.parse("msg")
+    assert res.event == "subscribe"
+    assert res.symbol is None
 
 def test_parse_error(mocker, parser):
     mocker.patch('core.serialization.json_deserializer.JsonDeserializer.deserialize', return_value={})
