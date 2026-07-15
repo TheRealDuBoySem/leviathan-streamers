@@ -144,6 +144,11 @@ class JournalIncrementalReader:
     Complete but invalid lines are quarantined and skipped so they cannot poison
     the tail-follow loop or respawn retries. Recovery from a skip episode is
     logged once (edge-triggered) when a valid JSON record is read again.
+
+    After seek/restore the byte cursor is always line-aligned (BOL). A redundant
+    ``reset_from_seq`` for the same logical ``start_seq`` does not rewind into
+    already-consumed byte ranges when the current offset is still inside the
+    journal file (bug #5 / checkpoint continue).
     """
 
     def __init__(self, journal: "TickJournal") -> None:
@@ -157,11 +162,20 @@ class JournalIncrementalReader:
     def reset_from_seq(self, start_seq: int) -> None:
         if not isinstance(start_seq, int) or start_seq < 0:
             raise ValueError("start_seq must be a non-negative integer")
-        self.__read_offset = self.__journal.byte_offset_for_seq(start_seq)
+        indexed_offset = self.__journal.byte_offset_for_seq(start_seq)
+        self.__read_offset = self.__choose_reset_offset(
+            start_seq=start_seq,
+            indexed_offset=indexed_offset,
+        )
+        self.__align_read_offset_to_line_boundary()
         self.__next_seq = start_seq
         # Seek starts a new read position; do not emit a false recovery signal.
         self.__consecutive_parse_failures = 0
         self.__last_skip_reason = None
+
+    def get_read_offset(self) -> int:
+        """Return the current byte cursor used for incremental reads."""
+        return self.__read_offset
 
     def get_invalid_line_skip_count(self) -> int:
         """Return lifetime count of complete lines quarantined/skipped as invalid."""
@@ -175,6 +189,52 @@ class JournalIncrementalReader:
         if start_seq != self.__next_seq:
             self.reset_from_seq(start_seq)
         return self.__read_new_records()
+
+    def __choose_reset_offset(self, *, start_seq: int, indexed_offset: int) -> int:
+        """
+        Pick the byte cursor for ``reset_from_seq``.
+
+        When the logical next seq is unchanged and the live cursor already sits
+        past the sparse index hint (and still inside the file), keep the
+        high-water mark so checkpoint continue cannot re-enter poison that was
+        already scanned. Past-EOF / shrunk-file cursors fall back to the index.
+        """
+        if start_seq != self.__next_seq:
+            return indexed_offset
+        if self.__read_offset <= indexed_offset:
+            return indexed_offset
+        journal_path = self.__journal.journal_path
+        try:
+            file_size = os.path.getsize(journal_path)
+        except OSError:
+            return indexed_offset
+        if self.__read_offset > file_size:
+            return indexed_offset
+        return self.__read_offset
+
+    def __align_read_offset_to_line_boundary(self) -> None:
+        """Advance ``__read_offset`` to the next BOL when a seek landed mid-line."""
+        if self.__read_offset <= 0:
+            return
+        journal_path = self.__journal.journal_path
+        if not os.path.exists(journal_path):
+            return
+        try:
+            with open(journal_path, "rb") as handle:
+                handle.seek(0, os.SEEK_END)
+                file_size = handle.tell()
+                if self.__read_offset >= file_size:
+                    self.__read_offset = file_size
+                    return
+                handle.seek(self.__read_offset - 1)
+                previous_byte = handle.read(1)
+                if previous_byte == b"\n":
+                    return
+                handle.seek(self.__read_offset)
+                handle.readline()
+                self.__read_offset = handle.tell()
+        except OSError:
+            return
 
     def __log_recovery_if_needed(self) -> None:
         if self.__consecutive_parse_failures <= 0:
@@ -397,10 +457,25 @@ class TickJournal:
             self.__meta["seq_index"] = index[-256:]
 
     def byte_offset_for_seq(self, start_seq: int) -> int:
+        """
+        Return the BOL byte offset where incremental reads should begin for
+        ``start_seq``.
+
+        Uses the sparse ``seq_index`` as a hint, then walks forward to the first
+        complete line whose seq is >= start_seq. Invalid lines are skipped
+        silently during resolution (no quarantine) so restore/reset cannot
+        re-enter already-passed poison just to locate the tip.
+        """
         if not isinstance(start_seq, int) or start_seq < 0:
             raise ValueError("start_seq must be a non-negative integer")
         if start_seq <= 1:
             return 0
+        return self.__resolve_byte_offset_for_seq(
+            start_seq,
+            self.__indexed_byte_offset_hint(start_seq),
+        )
+
+    def __indexed_byte_offset_hint(self, start_seq: int) -> int:
         index = self.__meta.get("seq_index", [[0, 0]])
         chosen = [0, 0]
         for entry in index:
@@ -412,6 +487,47 @@ class TickJournal:
             else:
                 break
         return int(chosen[1])
+
+    def __resolve_byte_offset_for_seq(self, start_seq: int, indexed_offset: int) -> int:
+        if not os.path.exists(self.__journal_path):
+            return indexed_offset
+        try:
+            with open(self.__journal_path, "rb") as handle:
+                handle.seek(0, os.SEEK_END)
+                file_size = handle.tell()
+                offset = min(max(0, indexed_offset), file_size)
+                if offset > 0:
+                    handle.seek(offset - 1)
+                    if handle.read(1) != b"\n":
+                        handle.seek(offset)
+                        handle.readline()
+                        offset = handle.tell()
+                handle.seek(offset)
+                while True:
+                    line_start = handle.tell()
+                    line = handle.readline()
+                    if not line:
+                        return line_start
+                    if not line.endswith(b"\n"):
+                        return line_start
+                    stripped = line.strip()
+                    if not stripped:
+                        continue
+                    try:
+                        record = json.loads(stripped.decode("utf-8"))
+                        seq = int(record["seq"])
+                    except (
+                        UnicodeDecodeError,
+                        json.JSONDecodeError,
+                        KeyError,
+                        TypeError,
+                        ValueError,
+                    ):
+                        continue
+                    if seq >= start_seq:
+                        return line_start
+        except OSError:
+            return indexed_offset
 
     def latest_seq(self) -> int:
         with self.__thread_lock:

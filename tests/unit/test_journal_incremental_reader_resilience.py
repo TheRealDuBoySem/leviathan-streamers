@@ -337,3 +337,294 @@ async def test_journal_tick_stream_survives_poison_line(tmp_path):
         stream_task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await stream_task
+
+
+def test_reader_aligns_mid_line_seek_before_parsing(tmp_path, caplog):
+    """
+    Bug #5: after restore/seek, landing mid-line must advance to the next newline
+    before parsing — never treat a torn suffix as a complete invalid line.
+    """
+    journal = TickJournal(str(tmp_path), seq_index_interval=1)
+    line1 = _record_line(1, "first") + "\n"
+    line2 = _record_line(2, "second", ts=1100) + "\n"
+    with open(journal.journal_path, "w", encoding="utf-8") as handle:
+        handle.write(line1)
+        handle.write(line2)
+    mid_line_offset = len(line1.encode("utf-8")) // 2
+    assert 0 < mid_line_offset < len(line1.encode("utf-8"))
+    # byte_offset_for_seq(1) always returns 0; use start_seq>=2 so the sparse
+    # index mid-line offset is actually used on seek.
+    journal._TickJournal__meta["latest_seq"] = 2
+    journal._TickJournal__meta["seq_index"] = [[0, 0], [2, mid_line_offset]]
+    journal.flush_meta()
+
+    reader = JournalIncrementalReader(journal)
+    with caplog.at_level(logging.WARNING):
+        records = reader.poll(2)
+
+    assert [tick.trade_id for _, tick in records] == ["second"]
+    assert reader.get_invalid_line_skip_count() == 0
+    assert not any("skipped invalid" in r.message.lower() for r in caplog.records)
+
+
+def test_fresh_reset_to_tip_does_not_requarantine_prefix_poison(tmp_path):
+    """
+    Bug #5 cold restore: seeking to a high start_seq via sparse index must not
+    re-quarantine already-passed poison while resolving the byte cursor.
+    """
+    journal = TickJournal(str(tmp_path), seq_index_interval=100)
+    with open(journal.journal_path, "w", encoding="utf-8") as handle:
+        handle.write("{prefix-poison\n")
+        for seq in range(1, 6):
+            handle.write(_record_line(seq, f"t{seq}", ts=1000 + seq) + "\n")
+    journal._TickJournal__meta["latest_seq"] = 5
+    journal._TickJournal__meta["seq_index"] = [[0, 0]]
+    journal.flush_meta()
+
+    reader = JournalIncrementalReader(journal)
+    assert reader.poll(6) == []
+    assert reader.get_invalid_line_skip_count() == 0
+    assert reader.get_read_offset() > 0
+
+
+def test_reset_same_seq_does_not_rewind_into_already_scanned_poison(tmp_path):
+    """
+    Bug #5: sparse-index reset_from_seq must not pull the byte cursor backwards
+    into already-consumed poison when the logical next seq is unchanged
+    (checkpoint continue / redundant restore).
+    """
+    journal = TickJournal(str(tmp_path), seq_index_interval=100)
+    with open(journal.journal_path, "w", encoding="utf-8") as handle:
+        handle.write("{poison-prefix\n")
+        for seq in range(1, 6):
+            handle.write(_record_line(seq, f"t{seq}", ts=1000 + seq) + "\n")
+    journal._TickJournal__meta["latest_seq"] = 5
+    journal._TickJournal__meta["seq_index"] = [[0, 0]]
+    journal.flush_meta()
+
+    reader = JournalIncrementalReader(journal)
+    first = reader.poll(1)
+    assert [tick.trade_id for _, tick in first] == [f"t{i}" for i in range(1, 6)]
+    assert reader.get_invalid_line_skip_count() == 1
+    tip_offset = reader.get_read_offset()
+    assert tip_offset > 0
+
+    reader.reset_from_seq(6)
+
+    assert reader.get_read_offset() >= tip_offset
+    assert reader.poll(6) == []
+    assert reader.get_invalid_line_skip_count() == 1
+
+
+def test_reset_same_seq_does_not_emit_false_recovery_after_poison(tmp_path, caplog):
+    """Redundant reset at the tip must not re-scan poison and log a fake recovery."""
+    journal = TickJournal(str(tmp_path), seq_index_interval=100)
+    with open(journal.journal_path, "w", encoding="utf-8") as handle:
+        handle.write("{poison\n")
+        handle.write(_record_line(1, "ok") + "\n")
+    journal._TickJournal__meta["latest_seq"] = 1
+    journal._TickJournal__meta["seq_index"] = [[0, 0]]
+    journal.flush_meta()
+
+    reader = JournalIncrementalReader(journal)
+    with caplog.at_level(logging.INFO):
+        assert reader.poll(1)[0][1].trade_id == "ok"
+        assert len(_recovery_log_records(caplog)) == 1
+        reader.reset_from_seq(2)
+        assert reader.poll(2) == []
+
+    assert len(_recovery_log_records(caplog)) == 1
+    assert reader.get_invalid_line_skip_count() == 1
+
+
+def test_reset_backward_start_seq_rescans_but_line_aligns(tmp_path):
+    """A true rewind (lower start_seq) may rescan; mid-line seeks still align."""
+    journal = TickJournal(str(tmp_path), seq_index_interval=1)
+    line1 = _record_line(1, "a") + "\n"
+    line2 = _record_line(2, "b", ts=1100) + "\n"
+    line3 = _record_line(3, "c", ts=1200) + "\n"
+    with open(journal.journal_path, "w", encoding="utf-8") as handle:
+        handle.write(line1)
+        handle.write(line2)
+        handle.write(line3)
+    mid = len(line1.encode("utf-8")) // 2
+    line1_len = len(line1.encode("utf-8"))
+    journal._TickJournal__meta["latest_seq"] = 3
+    journal._TickJournal__meta["seq_index"] = [
+        [0, 0],
+        [2, mid],
+        [3, line1_len + len(line2.encode("utf-8"))],
+    ]
+    journal.flush_meta()
+
+    reader = JournalIncrementalReader(journal)
+    assert [t.trade_id for _, t in reader.poll(3)] == ["c"]
+    reader.reset_from_seq(2)
+    # Mid-line index for seq 2 → align past torn line1 → read line2+.
+    assert [t.trade_id for _, t in reader.poll(2)] == ["b", "c"]
+    assert reader.get_invalid_line_skip_count() == 0
+
+
+@pytest.mark.asyncio
+async def test_journal_tick_stream_set_cursor_does_not_replay_poison(tmp_path):
+    """Checkpoint restore via set_cursor must not re-quarantine already-passed poison."""
+    journal = TickJournal(str(tmp_path), seq_index_interval=100)
+    with open(journal.journal_path, "w", encoding="utf-8") as handle:
+        handle.write("{early-poison\n")
+        handle.write(_record_line(1, "live") + "\n")
+    journal._TickJournal__meta["latest_seq"] = 1
+    journal._TickJournal__meta["seq_index"] = [[0, 0]]
+    journal.flush_meta()
+
+    stream = JournalTickStream(journal, poll_interval_seconds=0.01)
+    stream_task = asyncio.create_task(stream.start_streaming())
+    try:
+        tick = await asyncio.wait_for(stream.wait_for_next_tick(), timeout=1.0)
+        assert tick.trade_id == "live"
+        stream.mark_tick_as_processed()
+        skips_after_first = stream.get_invalid_line_skip_count()
+        assert skips_after_first >= 1
+
+        from core.journal.tick_journal import TickJournalCursor
+
+        stream.set_cursor(TickJournalCursor(last_processed_seq=1))
+        await asyncio.sleep(0.05)
+        assert stream.get_invalid_line_skip_count() == skips_after_first
+    finally:
+        await stream.stop()
+        stream_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await stream_task
+
+
+def test_choose_reset_offset_keeps_high_water_when_index_lags(tmp_path):
+    """Same-seq reset must keep tip offset when sparse index points earlier."""
+    journal = TickJournal(str(tmp_path), seq_index_interval=100)
+    with open(journal.journal_path, "w", encoding="utf-8") as handle:
+        for seq in range(1, 4):
+            handle.write(_record_line(seq, f"t{seq}", ts=1000 + seq) + "\n")
+    reader = JournalIncrementalReader(journal)
+    assert len(reader.poll(1)) == 3
+    tip = reader.get_read_offset()
+    # Force a stale sparse hint far behind the live tip.
+    kept = reader._JournalIncrementalReader__choose_reset_offset(
+        start_seq=4,
+        indexed_offset=0,
+    )
+    assert kept == tip
+
+
+def test_choose_reset_offset_falls_back_on_getsize_oserror(tmp_path, monkeypatch):
+    journal = TickJournal(str(tmp_path))
+    journal.append(_tick("t1"))
+    reader = JournalIncrementalReader(journal)
+    assert reader.poll(1)
+    tip = reader.get_read_offset()
+    reader._JournalIncrementalReader__next_seq = 2
+    reader._JournalIncrementalReader__read_offset = tip
+
+    def _boom(_path):
+        raise OSError("stat failed")
+
+    monkeypatch.setattr(os.path, "getsize", _boom)
+    assert (
+        reader._JournalIncrementalReader__choose_reset_offset(
+            start_seq=2,
+            indexed_offset=0,
+        )
+        == 0
+    )
+
+
+def test_choose_reset_offset_falls_back_when_cursor_past_eof(tmp_path):
+    journal = TickJournal(str(tmp_path))
+    journal.append(_tick("t1"))
+    reader = JournalIncrementalReader(journal)
+    assert reader.poll(1)
+    reader._JournalIncrementalReader__next_seq = 2
+    reader._JournalIncrementalReader__read_offset = 10**9
+    assert (
+        reader._JournalIncrementalReader__choose_reset_offset(
+            start_seq=2,
+            indexed_offset=7,
+        )
+        == 7
+    )
+
+
+def test_align_read_offset_noop_when_journal_missing(tmp_path):
+    journal = TickJournal(str(tmp_path))
+    missing = str(tmp_path / "missing_journal.jsonl")
+    journal._TickJournal__journal_path = missing
+    reader = JournalIncrementalReader(journal)
+    reader._JournalIncrementalReader__read_offset = 12
+    assert not os.path.exists(missing)
+    reader._JournalIncrementalReader__align_read_offset_to_line_boundary()
+    assert reader.get_read_offset() == 12
+
+
+def test_align_read_offset_advances_past_mid_line(tmp_path):
+    journal = TickJournal(str(tmp_path))
+    line1 = _record_line(1, "a") + "\n"
+    line2 = _record_line(2, "b", ts=1100) + "\n"
+    with open(journal.journal_path, "wb") as handle:
+        handle.write(line1.encode("utf-8"))
+        handle.write(line2.encode("utf-8"))
+    mid = len(line1.encode("utf-8")) // 2
+    reader = JournalIncrementalReader(journal)
+    reader._JournalIncrementalReader__read_offset = mid
+    reader._JournalIncrementalReader__align_read_offset_to_line_boundary()
+    assert reader.get_read_offset() == len(line1.encode("utf-8"))
+
+
+def test_align_read_offset_swallows_oserror(tmp_path, monkeypatch):
+    journal = TickJournal(str(tmp_path))
+    journal.append(_tick("t1"))
+    reader = JournalIncrementalReader(journal)
+    reader._JournalIncrementalReader__read_offset = 1
+
+    import builtins
+
+    real_open = builtins.open
+
+    def _boom(path, *args, **kwargs):
+        mode = args[0] if args else kwargs.get("mode", "r")
+        if str(path) == journal.journal_path and mode == "rb":
+            raise OSError("read failed")
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "open", _boom)
+    reader._JournalIncrementalReader__align_read_offset_to_line_boundary()
+    assert reader.get_read_offset() == 1
+
+
+def test_resolve_byte_offset_handles_blank_and_partial_trailing_line(tmp_path):
+    journal = TickJournal(str(tmp_path), seq_index_interval=100)
+    line1 = (_record_line(1, "a") + "\n").encode("utf-8")
+    blank = b"\n"
+    partial = _record_line(2, "partial")[:30].encode("utf-8")
+    with open(journal.journal_path, "wb") as handle:
+        handle.write(line1)
+        handle.write(blank)
+        handle.write(partial)
+    # Walk: seq1 (<2) → blank continue → partial without newline → line_start of partial.
+    offset = journal._TickJournal__resolve_byte_offset_for_seq(2, 0)
+    assert offset == len(line1) + len(blank)
+
+
+def test_resolve_byte_offset_falls_back_on_open_oserror(tmp_path, monkeypatch):
+    journal = TickJournal(str(tmp_path))
+    journal.append(_tick("t1"))
+
+    import builtins
+
+    real_open = builtins.open
+
+    def _boom(path, *args, **kwargs):
+        mode = args[0] if args else kwargs.get("mode", "r")
+        if str(path) == journal.journal_path and mode == "rb":
+            raise OSError("open failed")
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "open", _boom)
+    assert journal._TickJournal__resolve_byte_offset_for_seq(1, 42) == 42
