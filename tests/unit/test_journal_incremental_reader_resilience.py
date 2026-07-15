@@ -123,6 +123,21 @@ def test_reader_resume_after_skip_does_not_reparse_poison(tmp_path):
     assert revived[0][1].trade_id == "survivor"
 
 
+def test_resync_swallows_getsize_oserror(tmp_path, monkeypatch):
+    """Unable to stat the journal must not raise during the rewrite resync check."""
+    journal = TickJournal(str(tmp_path))
+    journal.append(_tick("t1"))
+    reader = JournalIncrementalReader(journal)
+    assert reader.poll(1)
+
+    def _boom(_path):
+        raise OSError("stat failed")
+
+    monkeypatch.setattr(os.path, "getsize", _boom)
+    # Exists() still true; resync path hits getsize OSError and returns quietly.
+    assert reader.poll(2) == []
+
+
 def test_invalid_line_warning_rate_limit_avoids_flood():
     assert _should_log_invalid_line(1) is True
     assert _should_log_invalid_line(3) is True
@@ -130,6 +145,122 @@ def test_invalid_line_warning_rate_limit_avoids_flood():
     assert _should_log_invalid_line(10) is True
     assert _should_log_invalid_line(11) is False
     assert _should_log_invalid_line(500) is True
+
+
+def _recovery_log_records(caplog):
+    return [
+        record
+        for record in caplog.records
+        if "recovered after" in record.message.lower()
+    ]
+
+
+def test_reader_logs_recovery_once_after_poison_then_valid(tmp_path, caplog):
+    journal = TickJournal(str(tmp_path))
+    with open(journal.journal_path, "w", encoding="utf-8") as handle:
+        handle.write("{not-valid-json\n")
+        handle.write("{also-broken\n")
+        handle.write(_record_line(1, "healed") + "\n")
+
+    reader = JournalIncrementalReader(journal)
+    with caplog.at_level(logging.INFO):
+        records = reader.poll(1)
+
+    assert [tick.trade_id for _, tick in records] == ["healed"]
+    assert reader.get_invalid_line_skip_count() == 2
+    assert reader.get_consecutive_parse_failures() == 0
+    recovery = _recovery_log_records(caplog)
+    assert len(recovery) == 1
+    assert "2 consecutive" in recovery[0].message
+    assert "last reason=" in recovery[0].message.lower()
+
+
+def test_reader_recovery_log_is_edge_triggered_not_spam(tmp_path, caplog):
+    journal = TickJournal(str(tmp_path))
+    with open(journal.journal_path, "w", encoding="utf-8") as handle:
+        handle.write("{poison\n")
+        handle.write(_record_line(1, "a") + "\n")
+        handle.write(_record_line(2, "b", ts=1100) + "\n")
+
+    reader = JournalIncrementalReader(journal)
+    with caplog.at_level(logging.INFO):
+        first = reader.poll(1)
+        second = reader.poll(3)
+
+    assert [tick.trade_id for _, tick in first] == ["a", "b"]
+    assert second == []
+    assert len(_recovery_log_records(caplog)) == 1
+
+
+def test_reader_logs_recovery_once_per_episode(tmp_path, caplog):
+    journal = TickJournal(str(tmp_path))
+    with open(journal.journal_path, "w", encoding="utf-8") as handle:
+        handle.write("{ep1\n")
+        handle.write(_record_line(1, "ok1") + "\n")
+
+    reader = JournalIncrementalReader(journal)
+    with caplog.at_level(logging.INFO):
+        assert reader.poll(1)[0][1].trade_id == "ok1"
+        with open(journal.journal_path, "a", encoding="utf-8") as handle:
+            handle.write("{ep2\n")
+            handle.write(_record_line(2, "ok2", ts=1100) + "\n")
+        assert reader.poll(2)[0][1].trade_id == "ok2"
+
+    assert reader.get_invalid_line_skip_count() == 2
+    assert len(_recovery_log_records(caplog)) == 2
+
+
+def test_reader_no_recovery_log_when_never_failed(tmp_path, caplog):
+    journal = TickJournal(str(tmp_path))
+    with open(journal.journal_path, "w", encoding="utf-8") as handle:
+        handle.write(_record_line(1, "clean") + "\n")
+
+    reader = JournalIncrementalReader(journal)
+    with caplog.at_level(logging.INFO):
+        records = reader.poll(1)
+
+    assert len(records) == 1
+    assert reader.get_invalid_line_skip_count() == 0
+    assert reader.get_consecutive_parse_failures() == 0
+    assert _recovery_log_records(caplog) == []
+
+
+def test_reader_consecutive_failures_while_still_poisoned(tmp_path):
+    journal = TickJournal(str(tmp_path))
+    with open(journal.journal_path, "w", encoding="utf-8") as handle:
+        handle.write("{a\n")
+        handle.write("{b\n")
+
+    reader = JournalIncrementalReader(journal)
+    assert reader.poll(1) == []
+    assert reader.get_invalid_line_skip_count() == 2
+    assert reader.get_consecutive_parse_failures() == 2
+
+
+@pytest.mark.asyncio
+async def test_journal_tick_stream_exposes_parse_failure_health_and_recovery(
+    tmp_path, caplog
+):
+    journal = TickJournal(str(tmp_path))
+    with open(journal.journal_path, "w", encoding="utf-8") as handle:
+        handle.write("{stream-poison\n")
+        handle.write(_record_line(1, "alive") + "\n")
+
+    stream = JournalTickStream(journal, poll_interval_seconds=0.01)
+    with caplog.at_level(logging.INFO):
+        stream_task = asyncio.create_task(stream.start_streaming())
+        try:
+            tick = await asyncio.wait_for(stream.wait_for_next_tick(), timeout=1.0)
+            assert tick.trade_id == "alive"
+            stream.mark_tick_as_processed()
+            assert stream.get_invalid_line_skip_count() >= 1
+            assert stream.get_consecutive_parse_failures() == 0
+            assert len(_recovery_log_records(caplog)) == 1
+        finally:
+            await stream.stop()
+            stream_task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await stream_task
 
 
 def test_quarantine_line_rejects_blank_reason(tmp_path):

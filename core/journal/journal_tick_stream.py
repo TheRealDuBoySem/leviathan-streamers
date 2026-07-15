@@ -110,6 +110,14 @@ class JournalTickStream(IExchangeStream):
     def cursor(self) -> TickJournalCursor:
         return TickJournalCursor(last_processed_seq=self.__cursor.last_processed_seq)
 
+    def get_invalid_line_skip_count(self) -> int:
+        """Return lifetime invalid journal lines skipped by the incremental reader."""
+        return self.__incremental_reader.get_invalid_line_skip_count()
+
+    def get_consecutive_parse_failures(self) -> int:
+        """Return current streak of skipped invalid lines since the last valid record."""
+        return self.__incremental_reader.get_consecutive_parse_failures()
+
     def register_on_reconnect(self, callback: Callable[[], Awaitable[None]]) -> None:
         if callback is None or not callable(callback):
             raise TypeError("callback must be a callable awaitable")

@@ -142,7 +142,8 @@ class JournalIncrementalReader:
 
     Incomplete trailing lines (no newline yet) are left unread until complete.
     Complete but invalid lines are quarantined and skipped so they cannot poison
-    the tail-follow loop or respawn retries.
+    the tail-follow loop or respawn retries. Recovery from a skip episode is
+    logged once (edge-triggered) when a valid JSON record is read again.
     """
 
     def __init__(self, journal: "TickJournal") -> None:
@@ -150,20 +151,47 @@ class JournalIncrementalReader:
         self.__read_offset = 0
         self.__next_seq = 1
         self.__skipped_invalid_lines = 0
+        self.__consecutive_parse_failures = 0
+        self.__last_skip_reason: Optional[str] = None
 
     def reset_from_seq(self, start_seq: int) -> None:
         if not isinstance(start_seq, int) or start_seq < 0:
             raise ValueError("start_seq must be a non-negative integer")
         self.__read_offset = self.__journal.byte_offset_for_seq(start_seq)
         self.__next_seq = start_seq
+        # Seek starts a new read position; do not emit a false recovery signal.
+        self.__consecutive_parse_failures = 0
+        self.__last_skip_reason = None
+
+    def get_invalid_line_skip_count(self) -> int:
+        """Return lifetime count of complete lines quarantined/skipped as invalid."""
+        return self.__skipped_invalid_lines
+
+    def get_consecutive_parse_failures(self) -> int:
+        """Return current streak of skipped invalid lines since the last valid record."""
+        return self.__consecutive_parse_failures
 
     def poll(self, start_seq: int) -> list[tuple[int, TradeTick]]:
         if start_seq != self.__next_seq:
             self.reset_from_seq(start_seq)
         return self.__read_new_records()
 
+    def __log_recovery_if_needed(self) -> None:
+        if self.__consecutive_parse_failures <= 0:
+            return
+        logger.info(
+            "JournalIncrementalReader recovered after %s consecutive parse failures "
+            "/ skipped invalid lines (last reason=%s)",
+            self.__consecutive_parse_failures,
+            self.__last_skip_reason or "unknown",
+        )
+        self.__consecutive_parse_failures = 0
+        self.__last_skip_reason = None
+
     def __quarantine_invalid_line(self, line: str, reason: str) -> None:
         self.__skipped_invalid_lines += 1
+        self.__consecutive_parse_failures += 1
+        self.__last_skip_reason = reason
         count = self.__skipped_invalid_lines
         self.__journal.quarantine_line(line, reason=reason)
         if _should_log_invalid_line(count):
@@ -194,12 +222,37 @@ class JournalIncrementalReader:
         except (KeyError, TypeError, ValueError) as exc:
             self.__quarantine_invalid_line(stripped, reason=str(exc))
             return None
+        self.__log_recovery_if_needed()
         return seq, tick
+
+    def __resync_if_journal_rewritten(self, journal_path: str) -> None:
+        """
+        Rebind the byte cursor after a concurrent compact/rewrite.
+
+        ``compact_before_seq`` replaces the journal file via ``os.replace``. A
+        live reader that still holds a pre-rewrite offset seeks past EOF and
+        starves forever (NEW-01). Detect that and resync from the logical seq.
+        """
+        try:
+            file_size = os.path.getsize(journal_path)
+        except OSError:
+            return
+        if self.__read_offset <= file_size:
+            return
+        logger.warning(
+            "JournalIncrementalReader offset past journal size after rewrite "
+            "(offset=%s size=%s); resyncing from seq=%s",
+            self.__read_offset,
+            file_size,
+            self.__next_seq,
+        )
+        self.reset_from_seq(self.__next_seq)
 
     def __read_new_records(self) -> list[tuple[int, TradeTick]]:
         journal_path = self.__journal.journal_path
         if not os.path.exists(journal_path):
             return []
+        self.__resync_if_journal_rewritten(journal_path)
         records: list[tuple[int, TradeTick]] = []
         with open(journal_path, "r", encoding="utf-8") as handle:
             handle.seek(self.__read_offset)
