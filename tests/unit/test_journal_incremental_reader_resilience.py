@@ -628,3 +628,528 @@ def test_resolve_byte_offset_falls_back_on_open_oserror(tmp_path, monkeypatch):
 
     monkeypatch.setattr(builtins, "open", _boom)
     assert journal._TickJournal__resolve_byte_offset_for_seq(1, 42) == 42
+
+
+# --- D4-01: sticky offset past EOF after rewrite / stale seq_index ---
+
+
+def _rewrite_warn_records(caplog):
+    return [
+        record
+        for record in caplog.records
+        if "offset past journal size after rewrite" in record.getMessage()
+    ]
+
+
+def test_d4_01_stale_seq_index_after_external_rewrite_recovers_without_spam(
+    tmp_path, caplog
+):
+    """
+    D4-01: after compact/rewrite, in-memory sparse seq_index can still point past
+    the new file size. Resync must rebind the cursor, resume ticks, and not flood
+    WARN on every empty poll with a stuck offset/seq.
+    """
+    journal = TickJournal(str(tmp_path), seq_index_interval=10)
+    for index in range(50):
+        journal.append(_tick(f"t{index}", ts=1000 + index))
+
+    reader = JournalIncrementalReader(journal)
+    assert len(reader.poll(1)) == 50
+    tip_offset = reader.get_read_offset()
+    assert tip_offset > 0
+
+    with open(journal.journal_path, "r", encoding="utf-8") as handle:
+        retained = [line for line in handle if line.strip()][-5:]
+    with open(journal.journal_path, "w", encoding="utf-8") as handle:
+        handle.writelines(retained)
+    rewritten_size = os.path.getsize(journal.journal_path)
+    assert tip_offset > rewritten_size
+
+    # Leave in-memory seq_index stale (other-process / pre-reload compact).
+    journal.append(_tick("post-rewrite", ts=2000))
+
+    with caplog.at_level(logging.WARNING):
+        recovered = reader.poll(51)
+        for _ in range(24):
+            if recovered:
+                break
+            recovered = reader.poll(51)
+
+    assert recovered, "reader must recover ticks after rewrite with stale seq_index"
+    assert [seq for seq, _ in recovered] == [51]
+    assert recovered[0][1].trade_id == "post-rewrite"
+    assert reader.get_read_offset() <= os.path.getsize(journal.journal_path)
+    assert reader.get_read_offset() != tip_offset
+    assert len(_rewrite_warn_records(caplog)) <= 2
+
+
+def test_d4_01_past_eof_resync_clamps_and_advances_on_subsequent_append(
+    tmp_path, caplog
+):
+    """
+    D4-01: live tip cursor past EOF after shrink must resync once, then consume
+    the next append without a WARN storm at a frozen offset.
+    """
+    journal = TickJournal(str(tmp_path))
+    for index in range(5):
+        journal.append(_tick(f"t{index}", ts=1000 + index))
+    reader = JournalIncrementalReader(journal)
+    assert len(reader.poll(1)) == 5
+    pre_offset = reader.get_read_offset()
+
+    with open(journal.journal_path, "r", encoding="utf-8") as handle:
+        last_line = [line for line in handle if line.strip()][-1]
+    with open(journal.journal_path, "w", encoding="utf-8") as handle:
+        handle.write(last_line)
+    assert pre_offset > os.path.getsize(journal.journal_path)
+
+    with caplog.at_level(logging.WARNING):
+        assert reader.poll(6) == []
+        offsets = [reader.get_read_offset()]
+        for _ in range(20):
+            assert reader.poll(6) == []
+            offsets.append(reader.get_read_offset())
+
+        journal.append(_tick("live", ts=3000))
+        resumed = reader.poll(6)
+
+    assert [seq for seq, _ in resumed] == [6]
+    assert resumed[0][1].trade_id == "live"
+    assert all(offset <= os.path.getsize(journal.journal_path) for offset in offsets)
+    assert pre_offset not in offsets
+    assert len(_rewrite_warn_records(caplog)) <= 2
+
+
+# --- D4-03: torn / partial journal line at sticky rewrite boundary ---
+
+
+def test_d4_03_sticky_mid_line_after_grow_past_eof_advances_without_reread_loop(
+    tmp_path, caplog
+):
+    """
+    D4-03 (hour-22): sticky offset sits past EOF until the file grows; cursor
+    then lands mid-object (e.g. ``k\":{…``). Reader must advance past the torn
+    region, recover at most once, and never re-parse the same remnant.
+    """
+    journal = TickJournal(str(tmp_path), seq_index_interval=100)
+    line1 = _record_line(1, "pad") + "\n"
+    # Incident-shaped torn suffix (complete line with newline, starts mid-object).
+    torn = (
+        'k":{"inst_id":"XRPUSDT","ts":1784154630404,"price":1.118,'
+        '"size":18.0,"side":"buy","trade_id":"1461415930925686784"}}\n'
+    )
+    healed = _record_line(2, "healed", ts=1100) + "\n"
+    sticky = len(line1.encode("utf-8")) + 2  # mid-torn, not BOL
+
+    # Phase 1: small file so sticky is past EOF (D4-01 neighbour).
+    with open(journal.journal_path, "w", encoding="utf-8") as handle:
+        handle.write(line1)
+    journal._TickJournal__meta["latest_seq"] = 1
+    journal._TickJournal__meta["seq_index"] = [[0, 0]]
+    journal.flush_meta()
+
+    reader = JournalIncrementalReader(journal)
+    assert reader.poll(1)[0][1].trade_id == "pad"
+    reader._JournalIncrementalReader__read_offset = sticky
+    reader._JournalIncrementalReader__next_seq = 2
+    assert reader.get_read_offset() > os.path.getsize(journal.journal_path)
+    assert reader.poll(2) == []  # still past EOF / waiting for grow
+
+    # Phase 2: file grows past sticky with torn mid-line + valid record.
+    with open(journal.journal_path, "w", encoding="utf-8") as handle:
+        handle.write(line1)
+        handle.write(torn)
+        handle.write(healed)
+    journal._TickJournal__meta["latest_seq"] = 2
+    journal.flush_meta()
+
+    with caplog.at_level(logging.INFO):
+        first = reader.poll(2)
+        second = reader.poll(3)
+
+    assert [tick.trade_id for _, tick in first] == ["healed"]
+    assert second == []
+    # Offset advanced past torn+healed; repeated polls must not re-hit torn.
+    assert reader.get_read_offset() == os.path.getsize(journal.journal_path)
+    assert reader.get_invalid_line_skip_count() <= 1
+    assert len(_recovery_log_records(caplog)) <= 1
+
+
+def test_d4_03_sticky_mid_line_truncated_eof_after_rewrite_does_not_stall(tmp_path):
+    """
+    D4-03: after rewrite, sticky offset mid-line and remnant runs to EOF without
+    a newline. Even when the remnant starts with a nested ``{`` (looks like an
+    in-progress object to D4-09), mid-line align must advance to EOF — not wait.
+    """
+    journal = TickJournal(str(tmp_path))
+    line1 = _record_line(1, "keep") + "\n"
+    # Mid offset deliberately lands on nested '{' so incomplete-wait would stall
+    # without BOL align (hour-22 sticky mid-object shape).
+    torn_no_nl = (
+        'k":{"inst_id":"XRPUSDT","ts":1,"price":1.0,"size":1.0,'
+        '"side":"buy","trade_id":"torn"}}'
+    )
+    with open(journal.journal_path, "w", encoding="utf-8") as handle:
+        handle.write(line1)
+        handle.write(torn_no_nl)
+
+    reader = JournalIncrementalReader(journal)
+    assert reader.poll(1)[0][1].trade_id == "keep"
+    mid = len(line1.encode("utf-8")) + 3  # points at '{'
+    assert torn_no_nl[3:4] == "{"
+    reader._JournalIncrementalReader__read_offset = mid
+    reader._JournalIncrementalReader__next_seq = 2
+
+    assert reader.poll(2) == []
+    assert reader.get_read_offset() == os.path.getsize(journal.journal_path)
+
+    with open(journal.journal_path, "a", encoding="utf-8") as handle:
+        handle.write("\n")
+        handle.write(_record_line(2, "after-rewrite", ts=1100) + "\n")
+
+    records = reader.poll(2)
+    assert [tick.trade_id for _, tick in records] == ["after-rewrite"]
+    assert reader.poll(3) == []
+
+
+def test_d4_03_file_shrink_under_sticky_offset_realigns_and_recovers_once(
+    tmp_path, caplog
+):
+    """
+    D4-03: journal shrink/rewrite while sticky offset remains numerically inside
+    the new file can land mid-line. Align must advance; no re-read loop.
+    """
+    journal = TickJournal(str(tmp_path), seq_index_interval=100)
+    for seq in range(1, 40):
+        journal.append(_tick(f"old{seq}", ts=1000 + seq))
+
+    reader = JournalIncrementalReader(journal)
+    assert len(reader.poll(1)) == 39
+    pre_rewrite_size = reader.get_read_offset()
+    assert reader.poll(40) == []
+
+    prefix = "".join(
+        _record_line(seq, f"new{seq}", ts=2000 + seq) + "\n" for seq in range(1, 6)
+    )
+    mid_line = _record_line(99, "discard-mid", ts=2099) + "\n"
+    suffix = "".join(
+        _record_line(seq, f"new{seq}", ts=2000 + seq) + "\n" for seq in range(6, 12)
+    )
+    content = prefix + mid_line + suffix
+    raw = content.encode("utf-8")
+    sticky = len(prefix.encode("utf-8")) + len(mid_line.encode("utf-8")) // 2
+    assert sticky < len(raw) < pre_rewrite_size
+    assert raw[sticky - 1 : sticky] != b"\n"
+
+    with open(journal.journal_path, "w", encoding="utf-8") as handle:
+        handle.write(content)
+    journal._TickJournal__meta["latest_seq"] = 11
+    journal._TickJournal__meta["seq_index"] = [[0, 0]]
+    journal.flush_meta()
+
+    reader._JournalIncrementalReader__next_seq = 6
+    reader._JournalIncrementalReader__read_offset = sticky
+
+    with caplog.at_level(logging.INFO):
+        records = reader.poll(6)
+        tip_after = reader.get_read_offset()
+        again = reader.poll(12)
+
+    assert tip_after > sticky
+    assert [s for s, _ in records] == list(range(6, 12))
+    assert [t.trade_id for _, t in records] == [f"new{s}" for s in range(6, 12)]
+    assert again == []
+    assert len(_recovery_log_records(caplog)) <= 1
+    assert any("journal shrunk under sticky offset" in r.message for r in caplog.records)
+
+
+def test_d4_03_newline_terminated_torn_suffix_skips_once_then_recovers(
+    tmp_path, caplog
+):
+    """Complete torn suffix at BOL uses Day-1 quarantine; recovery logs once."""
+    journal = TickJournal(str(tmp_path))
+    torn = (
+        'k":{"inst_id":"XRPUSDT","ts":1784154630404,"price":1.118,'
+        '"size":18.0,"side":"buy","trade_id":"1461415930925686784"}}\n'
+    )
+    valid = _record_line(1, "stream-ok") + "\n"
+    with open(journal.journal_path, "w", encoding="utf-8") as handle:
+        handle.write(torn)
+        handle.write(valid)
+
+    reader = JournalIncrementalReader(journal)
+    with caplog.at_level(logging.INFO):
+        records = reader.poll(1)
+        assert reader.poll(2) == []
+
+    assert [tick.trade_id for _, tick in records] == ["stream-ok"]
+    assert reader.get_invalid_line_skip_count() == 1
+    assert reader.get_consecutive_parse_failures() == 0
+    assert len(_recovery_log_records(caplog)) == 1
+    assert os.path.exists(journal.quarantine_path)
+    with open(journal.quarantine_path, "r", encoding="utf-8") as handle:
+        quarantine = handle.read()
+    assert "XRPUSDT" in quarantine
+    assert "1461415930925686784" in quarantine
+
+
+def test_reader_rejects_non_positive_incomplete_max_wait(tmp_path):
+    journal = TickJournal(str(tmp_path))
+    with pytest.raises(ValueError, match="incomplete_record_max_wait_seconds must be positive"):
+        JournalIncrementalReader(journal, incomplete_record_max_wait_seconds=0)
+
+
+# --- D4-09: poison-gated first-tick delay (incomplete trailing torn suffix) ---
+
+
+def test_reader_skips_incomplete_trailing_poison_suffix_immediately(tmp_path, caplog):
+    """
+    D4-09: torn journal suffixes that cannot be an in-progress JSON object
+    (no leading '{') must be quarantined on the first poll — not parked until
+    the next writer supplies a newline (observed ~33–56s startup delay).
+    """
+    journal = TickJournal(str(tmp_path))
+    poison = (
+        'id":"XRPUSDT","ts":1784147002135,"price":1.1125,'
+        '"size":22.0,"side":"buy","trade_id":"1461383935646507016"}}'
+    )
+    with open(journal.journal_path, "w", encoding="utf-8") as handle:
+        handle.write(poison)
+
+    reader = JournalIncrementalReader(journal)
+    with caplog.at_level(logging.WARNING):
+        assert reader.poll(1) == []
+
+    assert reader.get_invalid_line_skip_count() == 1
+    assert reader.get_read_offset() == len(poison.encode("utf-8"))
+    assert any("incomplete_trailing_poison" in r.message for r in caplog.records)
+    with open(journal.quarantine_path, "r", encoding="utf-8") as handle:
+        quarantine = json.loads(handle.readline())
+    assert quarantine["reason"] == "incomplete_trailing_poison"
+    assert quarantine["line"] == poison
+
+
+def test_reader_reaches_valid_tick_after_trailing_poison_without_waiting_for_newline(
+    tmp_path,
+):
+    """After skipping EOF poison, a subsequent complete record is visible immediately."""
+    journal = TickJournal(str(tmp_path))
+    poison = 'id":"XRPUSDT","ts":1,"price":1.0,"size":1.0,"side":"buy","trade_id":"t"}}'
+    with open(journal.journal_path, "w", encoding="utf-8") as handle:
+        handle.write(poison)
+
+    reader = JournalIncrementalReader(journal)
+    assert reader.poll(1) == []
+    assert reader.get_invalid_line_skip_count() == 1
+
+    with open(journal.journal_path, "a", encoding="utf-8") as handle:
+        handle.write(_record_line(1, "survivor") + "\n")
+
+    records = reader.poll(1)
+    assert len(records) == 1
+    assert records[0][1].trade_id == "survivor"
+
+
+def test_reader_skips_stale_incomplete_json_object_after_max_wait(tmp_path):
+    """
+    D4-09: a `{`-prefixed incomplete write that never completes must not gate
+    startup forever — skip after incomplete_record_max_wait_seconds.
+    """
+    journal = TickJournal(str(tmp_path))
+    partial = _record_line(1, "stuck")[:40]
+    with open(journal.journal_path, "w", encoding="utf-8") as handle:
+        handle.write(partial)
+
+    clock = {"now": 1000.0}
+    reader = JournalIncrementalReader(
+        journal,
+        incomplete_record_max_wait_seconds=0.5,
+        clock=lambda: clock["now"],
+    )
+    assert reader.poll(1) == []
+    assert reader.get_invalid_line_skip_count() == 0
+
+    clock["now"] = 1000.6
+    assert reader.poll(1) == []
+    assert reader.get_invalid_line_skip_count() == 1
+    assert reader.get_read_offset() == len(partial.encode("utf-8"))
+
+
+@pytest.mark.asyncio
+async def test_journal_tick_stream_bounds_time_to_first_tick_with_trailing_poison(
+    tmp_path,
+):
+    """
+    D4-09: spawn-path latency — trailing torn poison (no newline) must be
+    skipped promptly so the first valid append is not gated for tens of seconds.
+    """
+    journal = TickJournal(str(tmp_path))
+    poison = (
+        'st_id":"XRPUSDT","ts":1784119124623,"price":1.1108,'
+        '"size":137.0,"side":"buy","trade_id":"1461267008886415360"}}'
+    )
+    with open(journal.journal_path, "w", encoding="utf-8") as handle:
+        handle.write(poison)
+
+    stream = JournalTickStream(journal, poll_interval_seconds=0.01)
+    stream_task = asyncio.create_task(stream.start_streaming())
+    try:
+        started = asyncio.get_running_loop().time()
+        for _ in range(50):
+            if stream.get_invalid_line_skip_count() >= 1:
+                break
+            await asyncio.sleep(0.01)
+        assert stream.get_invalid_line_skip_count() >= 1
+        assert asyncio.get_running_loop().time() - started < 0.5
+
+        with open(journal.journal_path, "a", encoding="utf-8") as handle:
+            handle.write(_record_line(1, "first-live") + "\n")
+
+        tick = await asyncio.wait_for(stream.wait_for_next_tick(), timeout=1.0)
+        elapsed = asyncio.get_running_loop().time() - started
+        assert tick.trade_id == "first-live"
+        assert elapsed < 1.0
+        stream.mark_tick_as_processed()
+    finally:
+        await stream.stop()
+        stream_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await stream_task
+
+def test_reader_rejects_non_callable_clock(tmp_path):
+    journal = TickJournal(str(tmp_path))
+    with pytest.raises(TypeError, match="clock must be callable"):
+        JournalIncrementalReader(journal, clock=123)  # type: ignore[arg-type]
+
+
+def test_read_progress_snapshot_handles_missing_journal_file(tmp_path, mocker):
+    journal = TickJournal(str(tmp_path))
+    journal.append(
+        TradeTick("XRPUSDT", 1000, 0.5, 1.0, "buy", "a")
+    )
+    reader = JournalIncrementalReader(journal)
+    mocker.patch("os.path.getsize", side_effect=OSError("gone"))
+    snapshot = reader.get_read_progress_snapshot()
+    assert snapshot["journal_size"] == 0
+
+
+def test_choose_reset_offset_clamps_indexed_hint_past_eof(tmp_path):
+    journal = TickJournal(str(tmp_path))
+    journal.append(
+        TradeTick("XRPUSDT", 1000, 0.5, 1.0, "buy", "a")
+    )
+    reader = JournalIncrementalReader(journal)
+    reader.reset_from_seq(1)
+    file_size = os.path.getsize(journal.journal_path)
+    chosen = reader._JournalIncrementalReader__choose_reset_offset(
+        start_seq=2,
+        indexed_offset=file_size + 50,
+    )
+    assert chosen == file_size
+
+
+def test_should_skip_incomplete_empty_fragment_is_false(tmp_path):
+    journal = TickJournal(str(tmp_path))
+    reader = JournalIncrementalReader(journal)
+    assert (
+        reader._JournalIncrementalReader__should_skip_incomplete_trailing_fragment("")
+        is False
+    )
+
+
+def test_reload_seq_index_from_disk_tolerates_bad_meta(tmp_path, mocker):
+    journal = TickJournal(str(tmp_path))
+    journal.append(
+        TradeTick("XRPUSDT", 1000, 0.5, 1.0, "buy", "a")
+    )
+    mocker.patch.object(
+        journal,
+        "_TickJournal__load_meta",
+        side_effect=OSError("meta missing"),
+    )
+    journal.reload_seq_index_from_disk()  # must not raise
+
+    mocker.patch.object(
+        journal,
+        "_TickJournal__load_meta",
+        return_value={"seq_index": "not-a-list", "latest_seq": 1},
+    )
+    journal.reload_seq_index_from_disk()  # non-list index ignored
+
+
+def test_resync_past_eof_clamps_when_reset_still_past_size(tmp_path, mocker):
+    journal = TickJournal(str(tmp_path))
+    with open(journal.journal_path, "w", encoding="utf-8") as handle:
+        handle.write('{"seq":1,"tick":{"inst_id":"XRPUSDT","ts":1,"price":1.0,"size":1.0,"side":"buy","trade_id":"a"}}\n')
+    journal._TickJournal__meta["latest_seq"] = 1
+    journal._TickJournal__meta["seq_index"] = [[0, 0]]
+    journal.flush_meta()
+
+    reader = JournalIncrementalReader(journal)
+    reader._JournalIncrementalReader__next_seq = 1
+    reader._JournalIncrementalReader__read_offset = 10_000
+    reader._JournalIncrementalReader__past_eof_resync_logged = False
+
+    def fake_reset(start_seq: int) -> None:
+        reader._JournalIncrementalReader__read_offset = 20_000
+
+    mocker.patch.object(reader, "reset_from_seq", side_effect=fake_reset)
+    reader._JournalIncrementalReader__resync_if_journal_rewritten(
+        journal.journal_path
+    )
+    assert reader._JournalIncrementalReader__read_offset == os.path.getsize(
+        journal.journal_path
+    )
+
+
+def test_abandon_incomplete_tip_force_false_skips_after_wait(tmp_path):
+    """Cover force=False branch of __abandon_incomplete_tip_at_cursor (D4-09)."""
+    journal = TickJournal(str(tmp_path))
+    complete = _record_line(1, "ok") + "\n"
+    torn = '{"seq":2,"tick":{"inst_id":"BTCUSDT"'
+    with open(journal.journal_path, "w", encoding="utf-8") as handle:
+        handle.write(complete)
+        handle.write(torn)
+
+    with open(journal.journal_path, "r", encoding="utf-8") as handle:
+        handle.readline()
+        tip_offset = handle.tell()
+
+    clock = {"t": 100.0}
+
+    def now() -> float:
+        return clock["t"]
+
+    reader = JournalIncrementalReader(
+        journal,
+        incomplete_record_max_wait_seconds=1.0,
+        clock=now,
+    )
+    reader._JournalIncrementalReader__read_offset = tip_offset
+    # First call arms the wait window without quarantining.
+    reader._JournalIncrementalReader__abandon_incomplete_tip_at_cursor(force=False)
+    assert reader.get_invalid_line_skip_count() == 0
+    assert reader._JournalIncrementalReader__pending_incomplete_offset == tip_offset
+    clock["t"] = 102.0
+    reader._JournalIncrementalReader__abandon_incomplete_tip_at_cursor(force=False)
+    assert reader.get_invalid_line_skip_count() == 1
+    assert reader._JournalIncrementalReader__pending_incomplete_offset is None
+
+
+def test_abandon_incomplete_tip_swallows_oserror(tmp_path, mocker):
+    journal = TickJournal(str(tmp_path))
+    with open(journal.journal_path, "w", encoding="utf-8") as handle:
+        handle.write(_record_line(1, "ok") + "\n")
+    reader = JournalIncrementalReader(journal)
+    mocker.patch("builtins.open", side_effect=OSError("io fail"))
+    reader._JournalIncrementalReader__abandon_incomplete_tip_at_cursor(force=False)
+
+
+def test_reload_seq_index_from_disk_tolerates_json_decode_error(tmp_path, mocker):
+    journal = TickJournal(str(tmp_path))
+    mocker.patch.object(
+        journal,
+        "_TickJournal__load_meta",
+        side_effect=json.JSONDecodeError("bad", "doc", 0),
+    )
+    journal.reload_seq_index_from_disk()

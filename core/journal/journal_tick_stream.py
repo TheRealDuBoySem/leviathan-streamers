@@ -9,10 +9,15 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
+import time
 from typing import AsyncIterator, Awaitable, Callable, List, Optional
 
 from core.interfaces.base import IExchangeStream, IPriceObserver
-from core.journal.tick_journal import TickJournal, TickJournalCursor
+from core.journal.tick_journal import (
+    DEFAULT_EMPTY_POLL_DIAGNOSTIC_SECONDS,
+    TickJournal,
+    TickJournalCursor,
+)
 from leviathan_common.models.trade_tick import TradeTick
 
 logger = logging.getLogger(__name__)
@@ -77,30 +82,48 @@ class JournalTickStream(IExchangeStream):
         poll_interval_seconds: float = 0.05,
         symbols: Optional[List[str]] = None,
         on_stream_fatal: Optional[Callable[[str], None]] = None,
+        empty_poll_diagnostic_seconds: float = DEFAULT_EMPTY_POLL_DIAGNOSTIC_SECONDS,
+        clock: Optional[Callable[[], float]] = None,
+        incomplete_record_max_wait_seconds: Optional[float] = None,
     ) -> None:
         if not isinstance(journal, TickJournal):
             raise TypeError("journal must be a TickJournal instance")
         if poll_interval_seconds <= 0:
             raise ValueError("poll_interval_seconds must be positive")
+        if empty_poll_diagnostic_seconds <= 0:
+            raise ValueError("empty_poll_diagnostic_seconds must be positive")
         if on_stream_fatal is not None and not callable(on_stream_fatal):
             raise TypeError("on_stream_fatal must be callable")
+        if clock is not None and not callable(clock):
+            raise TypeError("clock must be callable")
         initial_symbols = list(symbols or [])
         if initial_symbols:
             _validate_initial_symbols(initial_symbols)
         self.__journal = journal
         self.__poll_interval = float(poll_interval_seconds)
+        self.__empty_poll_diagnostic_seconds = float(empty_poll_diagnostic_seconds)
+        self.__clock: Callable[[], float] = clock if clock is not None else time.monotonic
         self.__symbols = initial_symbols
         self.__stopped = False
         self.__connected = False
         self.__streaming = False
         self.__queue: asyncio.Queue[tuple[int, TradeTick]] = asyncio.Queue()
-        self.__incremental_reader = journal.create_incremental_reader()
+        reader_kwargs = {}
+        if incomplete_record_max_wait_seconds is not None:
+            reader_kwargs["incomplete_record_max_wait_seconds"] = (
+                incomplete_record_max_wait_seconds
+            )
+        if clock is not None:
+            reader_kwargs["clock"] = clock
+        self.__incremental_reader = journal.create_incremental_reader(**reader_kwargs)
         self.__observers: List[IPriceObserver] = []
         self.__on_reconnect_callbacks: List[Callable[[], Awaitable[None]]] = []
         self.__cursor = journal.load_cursor()
         self.__next_seq = self.__cursor.last_processed_seq + 1
         self.__pending_seq: Optional[int] = None
         self.__on_stream_fatal = on_stream_fatal
+        self.__empty_poll_since: Optional[float] = None
+        self.__last_unread_lag_log_at: Optional[float] = None
 
     @property
     def journal(self) -> TickJournal:
@@ -117,6 +140,10 @@ class JournalTickStream(IExchangeStream):
     def get_consecutive_parse_failures(self) -> int:
         """Return current streak of skipped invalid lines since the last valid record."""
         return self.__incremental_reader.get_consecutive_parse_failures()
+
+    def get_read_progress_snapshot(self) -> dict:
+        """Return journal reader offset/size/lag snapshot (D4-04 observability)."""
+        return self.__incremental_reader.get_read_progress_snapshot()
 
     def register_on_reconnect(self, callback: Callable[[], Awaitable[None]]) -> None:
         if callback is None or not callable(callback):
@@ -202,6 +229,8 @@ class JournalTickStream(IExchangeStream):
                 records = self.__incremental_reader.poll(self.__next_seq)
                 if records:
                     consecutive_errors = 0
+                    self.__empty_poll_since = None
+                    self.__last_unread_lag_log_at = None
                     for seq, tick in records:
                         self.__next_seq = seq + 1
                         if not self.__is_tick_for_active_subscription(tick):
@@ -215,6 +244,7 @@ class JournalTickStream(IExchangeStream):
                         self.__next_seq,
                     )
                 else:
+                    self.__maybe_log_unread_lag()
                     await asyncio.sleep(self.__poll_interval)
             except asyncio.CancelledError:
                 raise
@@ -236,6 +266,35 @@ class JournalTickStream(IExchangeStream):
                     self.__stopped = True
                     raise JournalStreamFatalError(reason) from exc
                 await asyncio.sleep(min(self.__poll_interval * consecutive_errors, 5.0))
+
+    def __maybe_log_unread_lag(self) -> None:
+        """D4-04: if still waiting, log journal offset/size/lag after N seconds."""
+        now = self.__clock()
+        if self.__empty_poll_since is None:
+            self.__empty_poll_since = now
+            return
+        waited = now - self.__empty_poll_since
+        if waited < self.__empty_poll_diagnostic_seconds:
+            return
+        if (
+            self.__last_unread_lag_log_at is not None
+            and (now - self.__last_unread_lag_log_at) < self.__empty_poll_diagnostic_seconds
+        ):
+            return
+        snapshot = self.__incremental_reader.get_read_progress_snapshot()
+        logger.warning(
+            "JournalTickStream journal unread lag while waiting for ticks "
+            "(waited=%.1fs, offset=%s, size=%s, next_seq=%s, latest_seq=%s, "
+            "lag_seq=%s, incomplete_stuck=%s)",
+            waited,
+            snapshot["read_offset"],
+            snapshot["journal_size"],
+            snapshot["next_seq"],
+            snapshot["latest_seq"],
+            snapshot["lag_seq"],
+            snapshot["incomplete_stuck"],
+        )
+        self.__last_unread_lag_log_at = now
 
     async def stop(self) -> None:
         self.__stopped = True

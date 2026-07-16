@@ -113,3 +113,97 @@ def test_journal_tick_stream_set_cursor_rejects_negative_seq(tmp_path):
     stream = JournalTickStream(TickJournal(str(tmp_path)))
     with pytest.raises(ValueError, match="non-negative"):
         stream.set_cursor(TickJournalCursor(last_processed_seq=-1))
+
+
+def test_journal_tick_stream_rejects_invalid_constructor_args(tmp_path):
+    journal = TickJournal(str(tmp_path))
+    with pytest.raises(TypeError, match="TickJournal"):
+        JournalTickStream(object())  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="poll_interval_seconds must be positive"):
+        JournalTickStream(journal, poll_interval_seconds=0)
+    with pytest.raises(ValueError, match="empty_poll_diagnostic_seconds must be positive"):
+        JournalTickStream(journal, empty_poll_diagnostic_seconds=0)
+    with pytest.raises(TypeError, match="on_stream_fatal must be callable"):
+        JournalTickStream(journal, on_stream_fatal=123)  # type: ignore[arg-type]
+    with pytest.raises(TypeError, match="clock must be callable"):
+        JournalTickStream(journal, clock=123)  # type: ignore[arg-type]
+
+
+def test_journal_tick_stream_get_read_progress_snapshot_delegates(tmp_path):
+    journal = TickJournal(str(tmp_path))
+    journal.append(_tick("a"))
+    stream = JournalTickStream(
+        journal,
+        incomplete_record_max_wait_seconds=1.5,
+    )
+    snapshot = stream.get_read_progress_snapshot()
+    assert "read_offset" in snapshot
+    assert "lag_seq" in snapshot
+
+
+@pytest.mark.asyncio
+async def test_journal_tick_stream_unread_lag_log_is_rate_limited(tmp_path, caplog):
+    """Second lag log within the diagnostic window must be suppressed (line 283)."""
+    import logging
+    import time as time_mod
+
+    journal = TickJournal(str(tmp_path))
+    journal.append(_tick("prior"))
+    journal.save_cursor(TickJournalCursor(last_processed_seq=1))
+
+    class Clock:
+        def __init__(self):
+            self.now = 1000.0
+
+        def __call__(self):
+            return self.now
+
+        def advance(self, seconds: float) -> None:
+            self.now += seconds
+
+    clock = Clock()
+    stream = JournalTickStream(
+        journal,
+        poll_interval_seconds=0.01,
+        empty_poll_diagnostic_seconds=0.05,
+        clock=clock,
+    )
+    stream_task = asyncio.create_task(stream.start_streaming())
+    try:
+        with caplog.at_level(logging.WARNING):
+            for _ in range(20):
+                clock.advance(0.03)
+                await asyncio.sleep(0.01)
+                if any("journal unread lag" in r.message.lower() for r in caplog.records):
+                    break
+            first_count = sum(
+                1 for r in caplog.records if "journal unread lag" in r.message.lower()
+            )
+            assert first_count >= 1
+            # Stay inside the rate-limit window relative to last log time.
+            for _ in range(5):
+                clock.advance(0.01)
+                await asyncio.sleep(0.01)
+            second_count = sum(
+                1 for r in caplog.records if "journal unread lag" in r.message.lower()
+            )
+            assert second_count == first_count
+            # Advance past the window → another log allowed.
+            clock.advance(0.06)
+            for _ in range(10):
+                clock.advance(0.02)
+                await asyncio.sleep(0.01)
+                if (
+                    sum(1 for r in caplog.records if "journal unread lag" in r.message.lower())
+                    > first_count
+                ):
+                    break
+            assert (
+                sum(1 for r in caplog.records if "journal unread lag" in r.message.lower())
+                > first_count
+            )
+    finally:
+        await stream.stop()
+        stream_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await stream_task
