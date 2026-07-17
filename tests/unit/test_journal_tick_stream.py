@@ -141,11 +141,15 @@ def test_journal_tick_stream_get_read_progress_snapshot_delegates(tmp_path):
     assert "lag_seq" in snapshot
 
 
+def _is_empty_poll_diagnostic(record) -> bool:
+    msg = record.message.lower()
+    return "journal unread lag" in msg or "waiting for new journal" in msg or "caught up at eof" in msg
+
+
 @pytest.mark.asyncio
-async def test_journal_tick_stream_unread_lag_log_is_rate_limited(tmp_path, caplog):
-    """Second lag log within the diagnostic window must be suppressed (line 283)."""
+async def test_journal_tick_stream_empty_poll_diagnostic_is_rate_limited(tmp_path, caplog):
+    """Second empty-poll diagnostic within the window must be suppressed."""
     import logging
-    import time as time_mod
 
     journal = TickJournal(str(tmp_path))
     journal.append(_tick("prior"))
@@ -170,37 +174,27 @@ async def test_journal_tick_stream_unread_lag_log_is_rate_limited(tmp_path, capl
     )
     stream_task = asyncio.create_task(stream.start_streaming())
     try:
-        with caplog.at_level(logging.WARNING):
+        with caplog.at_level(logging.DEBUG):
             for _ in range(20):
                 clock.advance(0.03)
                 await asyncio.sleep(0.01)
-                if any("journal unread lag" in r.message.lower() for r in caplog.records):
+                if any(_is_empty_poll_diagnostic(r) for r in caplog.records):
                     break
-            first_count = sum(
-                1 for r in caplog.records if "journal unread lag" in r.message.lower()
-            )
+            first_count = sum(1 for r in caplog.records if _is_empty_poll_diagnostic(r))
             assert first_count >= 1
-            # Stay inside the rate-limit window relative to last log time.
             for _ in range(5):
                 clock.advance(0.01)
                 await asyncio.sleep(0.01)
-            second_count = sum(
-                1 for r in caplog.records if "journal unread lag" in r.message.lower()
-            )
+            second_count = sum(1 for r in caplog.records if _is_empty_poll_diagnostic(r))
             assert second_count == first_count
-            # Advance past the window → another log allowed.
             clock.advance(0.06)
             for _ in range(10):
                 clock.advance(0.02)
                 await asyncio.sleep(0.01)
-                if (
-                    sum(1 for r in caplog.records if "journal unread lag" in r.message.lower())
-                    > first_count
-                ):
+                if sum(1 for r in caplog.records if _is_empty_poll_diagnostic(r)) > first_count:
                     break
             assert (
-                sum(1 for r in caplog.records if "journal unread lag" in r.message.lower())
-                > first_count
+                sum(1 for r in caplog.records if _is_empty_poll_diagnostic(r)) > first_count
             )
     finally:
         await stream.stop()

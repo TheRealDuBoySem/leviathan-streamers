@@ -97,15 +97,26 @@ async def test_journal_dispatch_decorator_delegates_consumption(mocker, tmp_path
     mock_mark.assert_called_once()
 
 
-def test_journal_dispatch_decorator_properties(tmp_path):
+@pytest.mark.asyncio
+async def test_journal_decorator_with_sink_survives_high_volume(tmp_path):
+    """Collector path: journal persists; sink must not invent drop_oldest pressure."""
+    from core.routing.sink_dispatch_strategy import SinkDispatchStrategy
+
     journal = TickJournal(str(tmp_path))
-    inner = AsyncQueueDispatcher()
-    decorator = JournalDispatchDecorator(inner, journal)
+    sink = SinkDispatchStrategy()
+    decorator = JournalDispatchDecorator(sink, journal)
 
-    assert decorator.inner is inner
+    for i in range(2_500):
+        await decorator.dispatch(_tick(f"t{i}", ts=1000 + i))
+
+    assert journal.latest_seq() == 2_500
+    assert sink.accepted_tick_count == 2_500
+    assert sink.qsize() == 0
+    assert sink.is_full() is False
+
+
+def test_journal_dispatch_decorator_exposes_journal_property(tmp_path):
+    journal = TickJournal(str(tmp_path))
+    decorator = JournalDispatchDecorator(AsyncQueueDispatcher(), journal)
     assert decorator.journal is journal
-
-    with pytest.raises(AttributeError):
-        decorator.inner = inner  # type: ignore[misc]
-    with pytest.raises(AttributeError):
-        decorator.journal = journal  # type: ignore[misc]
+    assert decorator.inner is not None

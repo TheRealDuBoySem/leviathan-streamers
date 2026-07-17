@@ -242,25 +242,40 @@ class JournalIncrementalReader:
         """
         Return offset/size/seq lag for cold-start observability (D4-04).
 
+        ``latest_seq`` is ``max(disk meta, reader-observed floor)`` so a stale
+        meta watermark (``META_PERSIST_INTERVAL``) cannot report
+        ``next_seq >> latest_seq`` after the reader has already consumed those
+        records from the journal file.
+
         ``lag_seq`` is how many journal seqs are at or beyond ``next_seq``
-        according to persisted meta (0 when caught up).
+        according to that effective tip (0 when caught up). When the byte
+        cursor is behind EOF (or an incomplete tip is pending) but meta still
+        looks caught up, ``lag_seq`` is at least 1 so callers do not treat
+        unread bytes as idle EOF.
         """
         try:
             journal_size = os.path.getsize(self.__journal.journal_path)
         except OSError:
             journal_size = 0
-        latest_seq = self.__journal.read_latest_seq_from_disk()
+        disk_latest = self.__journal.read_latest_seq_from_disk()
+        # Records already consumed imply tip >= next_seq - 1 even if meta lags.
+        observed_floor = max(0, self.__next_seq - 1)
+        latest_seq = max(int(disk_latest), observed_floor)
         if latest_seq >= self.__next_seq:
             lag_seq = latest_seq - self.__next_seq + 1
         else:
             lag_seq = 0
+        incomplete_stuck = self.__pending_incomplete_offset is not None
+        byte_unread = self.__read_offset < journal_size
+        if lag_seq == 0 and (byte_unread or incomplete_stuck):
+            lag_seq = 1
         return {
             "read_offset": self.__read_offset,
             "journal_size": journal_size,
             "next_seq": self.__next_seq,
             "latest_seq": latest_seq,
             "lag_seq": lag_seq,
-            "incomplete_stuck": self.__pending_incomplete_offset is not None,
+            "incomplete_stuck": incomplete_stuck,
         }
 
     def poll(self, start_seq: int) -> list[tuple[int, TradeTick]]:

@@ -62,6 +62,9 @@ def test_dispatcher_properties():
     assert dispatcher.dropped_tick_count == 0
     assert dispatcher.overflow_policy is OverflowPolicy.DROP_OLDEST
     assert dispatcher.drop_log_interval_seconds == 10.0
+    assert dispatcher.saturation_error_after_seconds == 60.0
+    assert dispatcher.saturation_error_drop_threshold == 1_000
+    assert dispatcher.saturation_duration_seconds is None
 
     with pytest.raises(AttributeError):
         dispatcher.maxsize = 20
@@ -238,4 +241,111 @@ async def test_drop_oldest_preserves_queue_task_done_invariant():
     await asyncio.wait_for(
         dispatcher.__dict__["_AsyncQueueDispatcher__queue"].join(),
         timeout=0.1,
+    )
+
+
+@pytest.mark.asyncio
+async def test_sustained_saturation_escalates_to_error(caplog, monkeypatch):
+    """Prolonged overflow must escalate from WARNING to ERROR (capacity signal)."""
+    clock = {"now": 1000.0}
+    monkeypatch.setattr(time, "monotonic", lambda: clock["now"])
+
+    dispatcher = AsyncQueueDispatcher(
+        maxsize=1,
+        overflow_policy=OverflowPolicy.DROP_NEWEST,
+        drop_log_interval_seconds=5.0,
+        saturation_error_after_seconds=30.0,
+        saturation_error_drop_threshold=10_000,
+    )
+    tick = _tick(inst_id="XRPUSDT", trade_id="1")
+    await dispatcher.dispatch(tick)
+
+    with caplog.at_level(logging.WARNING):
+        await dispatcher.dispatch(tick)  # first drop → WARNING
+        clock["now"] = 1030.0
+        await dispatcher.dispatch(tick)  # saturated 30s → ERROR
+
+    warnings = [r for r in caplog.records if "Consumer too slow" in r.message]
+    errors = [r for r in caplog.records if "Queue saturation sustained" in r.message]
+    assert len(warnings) == 1
+    assert warnings[0].levelno == logging.WARNING
+    assert len(errors) == 1
+    assert errors[0].levelno == logging.ERROR
+    assert "saturated_for=30.0s" in errors[0].message
+    assert "dropped_total=2" in errors[0].message
+    assert "XRPUSDT" in errors[0].message
+
+
+@pytest.mark.asyncio
+async def test_drop_threshold_escalates_to_error(caplog, monkeypatch):
+    """Crossing dropped_total threshold escalates even before duration threshold."""
+    clock = {"now": 5000.0}
+    monkeypatch.setattr(time, "monotonic", lambda: clock["now"])
+
+    dispatcher = AsyncQueueDispatcher(
+        maxsize=1,
+        overflow_policy=OverflowPolicy.DROP_NEWEST,
+        drop_log_interval_seconds=1.0,
+        saturation_error_after_seconds=3600.0,
+        saturation_error_drop_threshold=3,
+    )
+    tick = _tick(inst_id="XRPUSDT", trade_id="1")
+    await dispatcher.dispatch(tick)
+
+    with caplog.at_level(logging.WARNING):
+        await dispatcher.dispatch(tick)  # drop 1 → WARNING
+        clock["now"] = 5001.0
+        await dispatcher.dispatch(tick)  # drop 2 → WARNING (under threshold)
+        clock["now"] = 5002.0
+        await dispatcher.dispatch(tick)  # drop 3 → ERROR
+
+    errors = [r for r in caplog.records if "Queue saturation sustained" in r.message]
+    assert len(errors) == 1
+    assert errors[0].levelno == logging.ERROR
+    assert "dropped_total=3" in errors[0].message
+
+
+@pytest.mark.asyncio
+async def test_successful_enqueue_clears_saturation_timer(monkeypatch):
+    """Draining below capacity resets sustained-saturation tracking."""
+    clock = {"now": 1000.0}
+    monkeypatch.setattr(time, "monotonic", lambda: clock["now"])
+
+    dispatcher = AsyncQueueDispatcher(
+        maxsize=1,
+        overflow_policy=OverflowPolicy.DROP_NEWEST,
+        saturation_error_after_seconds=10.0,
+    )
+    await dispatcher.dispatch(_tick(trade_id="a"))
+    await dispatcher.dispatch(_tick(trade_id="drop"))  # starts saturation
+    assert dispatcher.saturation_duration_seconds == 0.0
+
+    clock["now"] = 1005.0
+    assert dispatcher.saturation_duration_seconds == pytest.approx(5.0)
+
+    retrieved = await dispatcher.wait_for_next_tick()
+    dispatcher.mark_tick_as_processed()
+    assert retrieved.trade_id == "a"
+
+    await dispatcher.dispatch(_tick(trade_id="b"))  # succeeds → clear timer
+    assert dispatcher.saturation_duration_seconds is None
+
+
+def test_dispatcher_saturation_contracts():
+    with pytest.raises(ValueError, match="saturation_error_after_seconds must be positive"):
+        AsyncQueueDispatcher(saturation_error_after_seconds=0)
+    with pytest.raises(ValueError, match="saturation_error_drop_threshold must be positive"):
+        AsyncQueueDispatcher(saturation_error_drop_threshold=0)
+    with pytest.raises(TypeError, match="saturation_error_after_seconds must be a number"):
+        AsyncQueueDispatcher(saturation_error_after_seconds="slow")  # type: ignore[arg-type]
+    with pytest.raises(TypeError, match="saturation_error_drop_threshold must be an integer"):
+        AsyncQueueDispatcher(saturation_error_drop_threshold=1.5)  # type: ignore[arg-type]
+
+
+def test_should_escalate_returns_false_when_saturation_timer_unset():
+    """Defensive branch: no saturation episode and under drop threshold."""
+    dispatcher = AsyncQueueDispatcher(saturation_error_drop_threshold=10_000)
+    assert (
+        dispatcher._AsyncQueueDispatcher__should_escalate_to_error(time.monotonic())
+        is False
     )

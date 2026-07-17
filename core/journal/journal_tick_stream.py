@@ -268,7 +268,12 @@ class JournalTickStream(IExchangeStream):
                 await asyncio.sleep(min(self.__poll_interval * consecutive_errors, 5.0))
 
     def __maybe_log_unread_lag(self) -> None:
-        """D4-04: if still waiting, log journal offset/size/lag after N seconds."""
+        """D4-04: if still waiting, log journal offset/size/lag after N seconds.
+
+        EOF with ``lag_seq==0`` means the reader is caught up and waiting for
+        new producer writes — that is not unread lag (DEBUG, renamed message).
+        Real unread lag / sticky incomplete tip stays WARNING.
+        """
         now = self.__clock()
         if self.__empty_poll_since is None:
             self.__empty_poll_since = now
@@ -282,10 +287,16 @@ class JournalTickStream(IExchangeStream):
         ):
             return
         snapshot = self.__incremental_reader.get_read_progress_snapshot()
-        logger.warning(
-            "JournalTickStream journal unread lag while waiting for ticks "
+        at_eof_caught_up = (
+            snapshot["read_offset"] >= snapshot["journal_size"]
+            and snapshot["lag_seq"] == 0
+            and not snapshot["incomplete_stuck"]
+        )
+        detail = (
             "(waited=%.1fs, offset=%s, size=%s, next_seq=%s, latest_seq=%s, "
-            "lag_seq=%s, incomplete_stuck=%s)",
+            "lag_seq=%s, incomplete_stuck=%s)"
+        )
+        args = (
             waited,
             snapshot["read_offset"],
             snapshot["journal_size"],
@@ -294,6 +305,16 @@ class JournalTickStream(IExchangeStream):
             snapshot["lag_seq"],
             snapshot["incomplete_stuck"],
         )
+        if at_eof_caught_up:
+            logger.debug(
+                "JournalTickStream waiting for new journal records at EOF " + detail,
+                *args,
+            )
+        else:
+            logger.warning(
+                "JournalTickStream journal unread lag while waiting for ticks " + detail,
+                *args,
+            )
         self.__last_unread_lag_log_at = now
 
     async def stop(self) -> None:

@@ -163,13 +163,37 @@ def test_read_progress_snapshot_exposes_offset_size_and_lag(tmp_path):
     assert "incomplete_stuck" in snapshot
 
 
+def test_read_progress_snapshot_latest_seq_not_stale_vs_reader_progress(tmp_path):
+    """
+    Meta may lag (META_PERSIST_INTERVAL); snapshot latest_seq must not stay
+    below records the reader has already consumed (next_seq >> disk watermark).
+    """
+    journal = TickJournal(str(tmp_path))
+    journal.append(_tick("a"))
+    journal.append(_tick("b"))
+    journal.append(_tick("c"))
+    # Persist a stale watermark while the file already holds seq 1..3.
+    journal._TickJournal__meta["latest_seq"] = 1
+    journal.flush_meta()
+
+    reader = JournalIncrementalReader(journal)
+    assert [seq for seq, _ in reader.poll(1)] == [1, 2, 3]
+    snapshot = reader.get_read_progress_snapshot()
+    assert snapshot["next_seq"] == 4
+    assert snapshot["latest_seq"] == 3
+    assert snapshot["lag_seq"] == 0
+    assert snapshot["read_offset"] == snapshot["journal_size"]
+
+
 @pytest.mark.asyncio
-async def test_journal_tick_stream_logs_lag_while_waiting_on_sticky_tip(tmp_path, caplog):
-    """Observability: after N seconds with no records, log offset/size/lag."""
+async def test_journal_tick_stream_eof_wait_is_not_warning_unread_lag(tmp_path, caplog):
+    """
+    P2: at EOF with lag_seq=0 the reader waits for new producer writes —
+    that must not be logged as WARNING 'unread lag'.
+    """
     journal = TickJournal(str(tmp_path))
     journal.append(_tick("prior"))
     journal.save_cursor(TickJournalCursor(last_processed_seq=1))
-    # Empty tip at EOF — stream waits with lag_seq=0 but still emits diagnostics.
 
     clock = _FakeClock()
     stream = JournalTickStream(
@@ -180,15 +204,82 @@ async def test_journal_tick_stream_logs_lag_while_waiting_on_sticky_tip(tmp_path
     )
     stream_task = asyncio.create_task(stream.start_streaming())
     try:
-        with caplog.at_level(logging.WARNING):
+        with caplog.at_level(logging.DEBUG):
             for _ in range(30):
+                clock.advance(0.02)
+                await asyncio.sleep(0.01)
+                if any(
+                    "waiting for new journal" in r.message.lower()
+                    or "eof" in r.message.lower()
+                    for r in caplog.records
+                    if r.name.endswith("journal_tick_stream")
+                    or "JournalTickStream" in r.message
+                ):
+                    break
+        eof_records = [
+            r
+            for r in caplog.records
+            if "JournalTickStream" in r.message
+            and (
+                "waiting for new journal" in r.message.lower()
+                or "caught up at eof" in r.message.lower()
+            )
+        ]
+        assert eof_records, "expected EOF-wait diagnostic log"
+        assert all(r.levelno < logging.WARNING for r in eof_records)
+        assert not any(
+            "journal unread lag" in r.message.lower() and r.levelno >= logging.WARNING
+            for r in caplog.records
+        )
+        assert any("offset=" in r.message for r in eof_records)
+        assert any("size=" in r.message for r in eof_records)
+    finally:
+        await stream.stop()
+        stream_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await stream_task
+
+
+@pytest.mark.asyncio
+async def test_journal_tick_stream_logs_warning_unread_lag_when_behind(tmp_path, caplog):
+    """Real unread lag (journal tip ahead of reader) stays WARNING."""
+    journal = TickJournal(str(tmp_path))
+    for i in range(5):
+        journal.append(_tick(f"t{i}", ts=1000 + i))
+    journal.flush_meta()
+    journal.save_cursor(TickJournalCursor(last_processed_seq=0))
+
+    # Park the stream cursor at seq 1 while meta tip is 5 → lag_seq > 0.
+    # Use a reader that never advances past an incomplete tip to force empty polls.
+    with open(journal.journal_path, "a", encoding="utf-8") as handle:
+        handle.write('{"seq":6,"tick":{')  # incomplete → poll yields [] after replay?
+
+    clock = _FakeClock()
+    stream = JournalTickStream(
+        journal,
+        poll_interval_seconds=0.01,
+        empty_poll_diagnostic_seconds=0.05,
+        incomplete_record_max_wait_seconds=30.0,
+        clock=clock,
+    )
+    # Force reader to sit behind tip: reset after consuming nothing by leaving
+    # next_seq at 1 while meta latest is 5 — first polls will drain then stick.
+    stream_task = asyncio.create_task(stream.start_streaming())
+    try:
+        # Drain queued ticks without marking so we focus on empty-poll diagnostics
+        # after catch-up; instead stop draining and wait for sticky incomplete tip.
+        await asyncio.sleep(0.05)
+        with caplog.at_level(logging.WARNING):
+            for _ in range(40):
                 clock.advance(0.02)
                 await asyncio.sleep(0.01)
                 if any("journal unread lag" in r.message.lower() for r in caplog.records):
                     break
-        assert any("journal unread lag" in r.message.lower() for r in caplog.records)
-        assert any("offset=" in r.message for r in caplog.records)
-        assert any("size=" in r.message for r in caplog.records)
+        # After draining complete records, sticky incomplete tip should warn.
+        assert any(
+            "journal unread lag" in r.message.lower() and r.levelno >= logging.WARNING
+            for r in caplog.records
+        )
     finally:
         await stream.stop()
         stream_task.cancel()
