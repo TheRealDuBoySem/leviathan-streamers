@@ -185,6 +185,39 @@ def test_read_progress_snapshot_latest_seq_not_stale_vs_reader_progress(tmp_path
     assert snapshot["read_offset"] == snapshot["journal_size"]
 
 
+def test_read_progress_snapshot_coerces_production_stale_meta_watermark(tmp_path):
+    """
+    D6-A04 / D5-08: reproduce H00-A03 pattern — disk meta frozen at 545482 while
+    the reader has already consumed far ahead (next_seq ~552k). Snapshot must
+    never report latest_seq << next_seq - 1 when those seqs were consumed.
+    """
+    stale_watermark = 545_482
+    consumed_through = 552_039
+    journal = TickJournal(str(tmp_path))
+    journal.append(_tick("seed"))
+    # Force the exact stale disk tip seen in 2026-07-17 logs.
+    journal._TickJournal__meta["latest_seq"] = stale_watermark
+    journal.flush_meta()
+    assert journal.read_latest_seq_from_disk() == stale_watermark
+
+    reader = JournalIncrementalReader(journal)
+    # Simulate a caught-up reader that already walked past the stale meta tip.
+    reader._JournalIncrementalReader__next_seq = consumed_through + 1
+    try:
+        reader._JournalIncrementalReader__read_offset = os.path.getsize(
+            journal.journal_path
+        )
+    except OSError:
+        reader._JournalIncrementalReader__read_offset = 0
+
+    snapshot = reader.get_read_progress_snapshot()
+    assert snapshot["next_seq"] == consumed_through + 1
+    assert snapshot["latest_seq"] == consumed_through
+    assert snapshot["latest_seq"] >= snapshot["next_seq"] - 1
+    assert snapshot["latest_seq"] > stale_watermark
+    assert snapshot["lag_seq"] == 0
+
+
 @pytest.mark.asyncio
 async def test_journal_tick_stream_eof_wait_is_not_warning_unread_lag(tmp_path, caplog):
     """

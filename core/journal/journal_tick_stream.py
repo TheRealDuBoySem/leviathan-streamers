@@ -33,6 +33,27 @@ class JournalStreamFatalError(RuntimeError):
         self.reason = reason
 
 
+def is_eof_caught_up_progress_snapshot(snapshot: dict) -> bool:
+    """
+    Return True when an empty poll is idle EOF wait, not unread lag (D5-07 / D6-A03).
+
+    The D6 pre-restart storm logged WARNING while already showing
+    ``offset==size``, ``lag_seq=0``, ``incomplete_stuck=False`` (sometimes with
+    stale ``latest_seq < next_seq``). That signature must never be WARNING.
+    """
+    try:
+        read_offset = int(snapshot["read_offset"])
+        journal_size = int(snapshot["journal_size"])
+        lag_seq = int(snapshot["lag_seq"])
+        incomplete_stuck = bool(snapshot["incomplete_stuck"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(
+            "progress snapshot must expose read_offset, journal_size, "
+            f"lag_seq, incomplete_stuck as numeric/bool fields: {exc}"
+        ) from exc
+    return read_offset >= journal_size and lag_seq == 0 and not incomplete_stuck
+
+
 def _validate_symbol(symbol: str, param_name: str = "symbol") -> None:
     if symbol is None:
         raise ValueError(f"{param_name} cannot be empty")
@@ -270,9 +291,9 @@ class JournalTickStream(IExchangeStream):
     def __maybe_log_unread_lag(self) -> None:
         """D4-04: if still waiting, log journal offset/size/lag after N seconds.
 
-        EOF with ``lag_seq==0`` means the reader is caught up and waiting for
-        new producer writes — that is not unread lag (DEBUG, renamed message).
-        Real unread lag / sticky incomplete tip stays WARNING.
+        EOF caught-up (``is_eof_caught_up_progress_snapshot``) is DEBUG only —
+        never the WARNING « unread lag » wording (D5-07 / D6-A03). Real unread
+        lag / sticky incomplete tip / byte cursor behind EOF stays WARNING.
         """
         now = self.__clock()
         if self.__empty_poll_since is None:
@@ -287,11 +308,6 @@ class JournalTickStream(IExchangeStream):
         ):
             return
         snapshot = self.__incremental_reader.get_read_progress_snapshot()
-        at_eof_caught_up = (
-            snapshot["read_offset"] >= snapshot["journal_size"]
-            and snapshot["lag_seq"] == 0
-            and not snapshot["incomplete_stuck"]
-        )
         detail = (
             "(waited=%.1fs, offset=%s, size=%s, next_seq=%s, latest_seq=%s, "
             "lag_seq=%s, incomplete_stuck=%s)"
@@ -305,7 +321,7 @@ class JournalTickStream(IExchangeStream):
             snapshot["lag_seq"],
             snapshot["incomplete_stuck"],
         )
-        if at_eof_caught_up:
+        if is_eof_caught_up_progress_snapshot(snapshot):
             logger.debug(
                 "JournalTickStream waiting for new journal records at EOF " + detail,
                 *args,
