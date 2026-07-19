@@ -166,6 +166,40 @@ class JournalTickStream(IExchangeStream):
         """Return journal reader offset/size/lag snapshot (D4-04 observability)."""
         return self.__incremental_reader.get_read_progress_snapshot()
 
+    def pending_buffered_tick_count(self) -> int:
+        """Return how many ticks sit in the consumer buffer (not yet marked processed)."""
+        return self.__queue.qsize()
+
+    def force_tail_resync_if_unread(self) -> bool:
+        """
+        Force incremental-reader rebind when progress shows unread lag (D7).
+
+        Idle EOF wait (``is_eof_caught_up_progress_snapshot``) is a no-op.
+        Real unread lag / incomplete tip triggers index reload + ``force_rebind``.
+
+        Returns:
+            True when a resync was performed, False when already caught up at EOF.
+        """
+        snapshot = self.__incremental_reader.get_read_progress_snapshot()
+        if is_eof_caught_up_progress_snapshot(snapshot):
+            return False
+        self.__journal.reload_seq_index_from_disk()
+        self.__incremental_reader.force_rebind_from_seq(self.__next_seq)
+        logger.warning(
+            "JournalTickStream forced tail resync due to unread lag "
+            "(offset=%s, size=%s, next_seq=%s, latest_seq=%s, lag_seq=%s, "
+            "incomplete_stuck=%s)",
+            snapshot["read_offset"],
+            snapshot["journal_size"],
+            snapshot["next_seq"],
+            snapshot["latest_seq"],
+            snapshot["lag_seq"],
+            snapshot["incomplete_stuck"],
+        )
+        self.__empty_poll_since = None
+        self.__last_unread_lag_log_at = None
+        return True
+
     def register_on_reconnect(self, callback: Callable[[], Awaitable[None]]) -> None:
         if callback is None or not callable(callback):
             raise TypeError("callback must be a callable awaitable")
@@ -390,8 +424,24 @@ class JournalTickStream(IExchangeStream):
         self.__cursor = cursor
         self.__next_seq = cursor.last_processed_seq + 1
         self.__pending_seq = None
+        # Catch-up / recovery must not leave stale buffered ticks ahead of the
+        # new cursor for the consumer to re-ingest (D7).
+        self.__drain_pending_tick_queue()
         self.__incremental_reader.reset_from_seq(self.__next_seq)
         self.__journal.save_cursor(cursor)
+
+    def __drain_pending_tick_queue(self) -> None:
+        """Drop buffered (seq, tick) pairs without notifying observers."""
+        while True:
+            try:
+                self.__queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            try:
+                self.__queue.task_done()
+            except ValueError:
+                # task_done without a matching unfinished join counter — ignore.
+                pass
 
     async def wait_for_next_tick(self) -> TradeTick:
         seq, tick = await self.__queue.get()

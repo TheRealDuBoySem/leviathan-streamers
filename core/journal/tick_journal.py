@@ -226,6 +226,34 @@ class JournalIncrementalReader:
         self.__consecutive_parse_failures = 0
         self.__last_skip_reason = None
 
+    def force_rebind_from_seq(self, start_seq: int) -> None:
+        """
+        Force a byte-cursor rebind from the sparse index (D7 proactive recovery).
+
+        Unlike ``reset_from_seq``, ignores the sticky high-water mark so a
+        mid-line / incomplete tip that parks empty polls can be abandoned and
+        re-aligned even when ``start_seq`` equals the current ``__next_seq``.
+        """
+        if not isinstance(start_seq, int) or start_seq < 0:
+            raise ValueError("start_seq must be a non-negative integer")
+        indexed_offset = self.__journal.byte_offset_for_seq(start_seq)
+        try:
+            file_size = os.path.getsize(self.__journal.journal_path)
+        except OSError:
+            file_size = None
+        if file_size is not None and indexed_offset > file_size:
+            indexed_offset = file_size
+        self.__read_offset = indexed_offset
+        self.__clear_incomplete_wait_state()
+        self.__logical_bol_offset = None
+        self.__align_read_offset_to_line_boundary()
+        self.__abandon_incomplete_tip_at_cursor(force=True)
+        self.__logical_bol_offset = self.__read_offset
+        self.__next_seq = start_seq
+        self.__consecutive_parse_failures = 0
+        self.__last_skip_reason = None
+        self.__past_eof_resync_logged = False
+
     def get_read_offset(self) -> int:
         """Return the current byte cursor used for incremental reads."""
         return self.__read_offset
