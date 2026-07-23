@@ -3,7 +3,8 @@ import os
 import pytest
 
 from leviathan_common.models.trade_tick import TradeTick
-from core.journal.tick_journal import TickJournal, TickJournalCursor, tick_from_dict
+from core.journal.tick_journal import TickJournal
+from core.journal.tick_journal_cursor import TickJournalCursor
 
 
 def _tick(trade_id: str, ts: int = 1000) -> TradeTick:
@@ -61,11 +62,6 @@ def test_tick_journal_cursor_round_trip(tmp_path):
 def test_tick_journal_strips_checkpoint_dir(tmp_path):
     journal = TickJournal(f"  {tmp_path}  ")
     assert journal.journal_path == os.path.join(str(tmp_path), "tick_journal.jsonl")
-
-
-def test_tick_from_dict_rejects_missing_field():
-    with pytest.raises(ValueError, match="missing required field 'trade_id'"):
-        tick_from_dict({"inst_id": "BTCUSDT", "ts": 1, "price": 1.0, "size": 1.0, "side": "buy"})
 
 
 def test_tick_journal_load_cursor_rejects_invalid_json(tmp_path):

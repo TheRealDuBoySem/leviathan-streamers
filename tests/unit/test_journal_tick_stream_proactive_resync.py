@@ -13,13 +13,11 @@ import os
 
 import pytest
 
+from core.journal.journal_incremental_reader import JournalIncrementalReader
 from core.journal.journal_tick_stream import JournalTickStream
-from core.journal.tick_journal import (
-    JournalIncrementalReader,
-    TickJournal,
-    TickJournalCursor,
-    tick_to_dict,
-)
+from core.journal.tick_journal import TickJournal
+from core.journal.tick_journal_codec import tick_to_dict
+from core.journal.tick_journal_cursor import TickJournalCursor
 from leviathan_common.models.trade_tick import TradeTick
 
 

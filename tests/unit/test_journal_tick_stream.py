@@ -6,11 +6,9 @@ import pytest
 
 from core.interfaces.base import IPriceObserver
 from leviathan_common.models.trade_tick import TradeTick
-from core.journal.tick_journal import (
-    JournalIncrementalReader,
-    TickJournal,
-    TickJournalCursor,
-)
+from core.journal.journal_incremental_reader import JournalIncrementalReader
+from core.journal.tick_journal import TickJournal
+from core.journal.tick_journal_cursor import TickJournalCursor
 from core.journal.journal_tick_stream import (
     JournalStreamFatalError,
     JournalTickStream,

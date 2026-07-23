@@ -13,7 +13,8 @@ from core.journal.journal_tick_stream import (
     _validate_symbol,
     _validate_symbols_list,
 )
-from core.journal.tick_journal import TickJournal, TickJournalCursor
+from core.journal.tick_journal import TickJournal
+from core.journal.tick_journal_cursor import TickJournalCursor
 from leviathan_common.models.trade_tick import TradeTick
 
 

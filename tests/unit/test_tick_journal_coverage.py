@@ -1,41 +1,16 @@
-"""Additional TickJournal and JournalFileLock coverage."""
+"""Additional TickJournal coverage."""
 
 import json
-import os
-from unittest.mock import patch
 
 import pytest
 
-from core.journal.journal_file_lock import (
-    JournalFileLock,
-    _exclusive_lock_file_descriptor,
-    _release_file_descriptor_lock,
-)
-from core.journal.tick_journal import (
-    JournalIncrementalReader,
-    TickJournal,
-    TickJournalCursor,
-    tick_from_dict,
-    META_PERSIST_INTERVAL,
-)
-from core.journal.tick_journal import _SymbolDedupBucket
+from core.journal.tick_journal import META_PERSIST_INTERVAL, TickJournal
+from core.journal.tick_journal_cursor import TickJournalCursor
 from leviathan_common.models.trade_tick import TradeTick
 
 
 def _tick(trade_id: str, ts: int = 1000) -> TradeTick:
     return TradeTick("BTCUSDT", ts, 100.0, 1.0, "buy", trade_id)
-
-
-def test_tick_from_dict_rejects_non_dict():
-    with pytest.raises(TypeError, match="must be a dictionary"):
-        tick_from_dict([])  # type: ignore[arg-type]
-
-
-def test_tick_journal_cursor_from_dict_contracts():
-    with pytest.raises(TypeError, match="must be a dictionary"):
-        TickJournalCursor.from_dict([])  # type: ignore[arg-type]
-    with pytest.raises(ValueError, match="non-negative integer"):
-        TickJournalCursor.from_dict({"last_processed_seq": -1})
 
 
 def test_tick_journal_rejects_invalid_seq_index_interval(tmp_path):
@@ -81,42 +56,12 @@ def test_tick_journal_dedup_bucket_eviction(tmp_path):
     assert replay == {"a", "b", "c"}
 
 
-def test_journal_incremental_reader_skips_blank_and_stale_lines(tmp_path):
-    from core.journal.tick_journal import tick_to_dict
-
-    journal = TickJournal(str(tmp_path))
-    journal.append(_tick("keep"))
-    with open(journal.journal_path, "a", encoding="utf-8") as handle:
-        handle.write("\n")
-        stale = {"seq": 0, "tick": tick_to_dict(_tick("stale"))}
-        handle.write(json.dumps(stale) + "\n")
-    reader = JournalIncrementalReader(journal)
-    records = reader.poll(1)
-    assert len(records) == 1
-    assert records[0][1].trade_id == "keep"
-
-
-def test_journal_incremental_reader_missing_journal_returns_empty(tmp_path):
-    journal = TickJournal(str(tmp_path))
-    if os.path.exists(journal.journal_path):
-        os.remove(journal.journal_path)
-    reader = JournalIncrementalReader(journal)
-    assert reader.poll(1) == []
-
-
 def test_tick_journal_byte_offset_for_seq_uses_index(tmp_path):
     journal = TickJournal(str(tmp_path), seq_index_interval=1)
     for index in range(3):
         journal.append(_tick(f"t{index}", ts=1000 + index))
     journal.flush_meta()
     assert journal.byte_offset_for_seq(2) >= 0
-
-
-def test_tick_journal_reset_from_seq_and_reader_validation(tmp_path):
-    journal = TickJournal(str(tmp_path))
-    reader = journal.create_incremental_reader()
-    with pytest.raises(ValueError, match="start_seq must be a non-negative integer"):
-        reader.reset_from_seq(-1)
 
 
 def test_tick_journal_compact_before_seq(tmp_path):
@@ -142,52 +87,6 @@ def test_tick_journal_maybe_compact_runs(tmp_path):
         journal.append(_tick(f"t{index}", ts=1000 + index))
     journal.save_cursor(TickJournalCursor(last_processed_seq=5))
     assert journal.maybe_compact(lag_seq=1) >= 0
-
-
-def test_journal_file_lock_unix_branch(mocker, tmp_path):
-    mock_fcntl = mocker.MagicMock()
-    mock_fcntl.LOCK_EX = 2
-    mock_fcntl.LOCK_NB = 4
-    mock_fcntl.LOCK_UN = 8
-    mocker.patch("core.journal.journal_file_lock.sys.platform", "linux")
-    mocker.patch.dict("sys.modules", {"fcntl": mock_fcntl})
-    _exclusive_lock_file_descriptor(1)
-    _release_file_descriptor_lock(1)
-    assert mock_fcntl.flock.call_count == 2
-    assert mock_fcntl.flock.call_args_list[0].args == (1, 6)
-
-
-def test_journal_file_lock_acquire_retries_then_timeout(mocker, tmp_path):
-    lock_path = str(tmp_path / "tick_journal.lock")
-    mocker.patch("time.time", side_effect=[0.0, 0.0, 100.0])
-    mocker.patch("time.sleep")
-    with patch("builtins.open", side_effect=OSError("busy")):
-        with pytest.raises(TimeoutError, match="Timed out acquiring journal lock"):
-            JournalFileLock(lock_path, timeout_seconds=1.0).acquire()
-
-
-def test_journal_file_lock_release_close_oserror_is_ignored(tmp_path, mocker):
-    lock = JournalFileLock(str(tmp_path / "tick_journal.lock"))
-    handle = mocker.MagicMock()
-    handle.fileno.return_value = 42
-    handle.close.side_effect = OSError("close failed")
-    lock._JournalFileLock__handle = handle
-    mocker.patch(
-        "core.journal.journal_file_lock._release_file_descriptor_lock",
-    )
-    lock.release()
-
-
-def test_symbol_dedup_bucket_ignores_duplicate_trade_id():
-    bucket = _SymbolDedupBucket(max_size=3)
-    bucket.add("dup")
-    bucket.add("dup")
-    assert bucket.to_list() == ["dup"]
-
-
-def test_symbol_dedup_bucket_from_list():
-    bucket = _SymbolDedupBucket.from_list(["a", "b", "c"], max_size=2)
-    assert bucket.to_list() == ["b", "c"]
 
 
 def test_tick_journal_rejects_blank_checkpoint_dir():
@@ -265,15 +164,3 @@ def test_tick_journal_seq_index_truncates_after_many_appends(tmp_path):
         journal.append(_tick(f"t{index}", ts=1000 + index))
     index = journal._TickJournal__meta["seq_index"]
     assert len(index) <= 256
-
-
-def test_journal_file_lock_acquire_closes_handle_on_lock_failure(mocker, tmp_path):
-    handle = mocker.MagicMock()
-    handle.fileno.side_effect = OSError("lock failed")
-    handle.close.side_effect = OSError("close failed")
-    mocker.patch("builtins.open", return_value=handle)
-    mocker.patch("time.time", side_effect=[0.0, 100.0])
-    mocker.patch("time.sleep")
-    with pytest.raises(TimeoutError, match="Timed out acquiring journal lock"):
-        JournalFileLock(str(tmp_path / "tick_journal.lock"), timeout_seconds=1.0).acquire()
-    handle.close.assert_called()

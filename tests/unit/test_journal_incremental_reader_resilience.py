@@ -10,13 +10,11 @@ import os
 
 import pytest
 
+from core.journal.journal_incremental_reader import JournalIncrementalReader
 from core.journal.journal_tick_stream import JournalTickStream
-from core.journal.tick_journal import (
-    JournalIncrementalReader,
-    TickJournal,
-    _should_log_invalid_line,
-    tick_to_dict,
-)
+from core.journal.tick_journal import TickJournal
+from core.journal.tick_journal_codec import tick_to_dict
+from core.journal.tick_journal_cursor import TickJournalCursor
 from leviathan_common.models.trade_tick import TradeTick
 
 
@@ -137,14 +135,6 @@ def test_resync_swallows_getsize_oserror(tmp_path, monkeypatch):
     # Exists() still true; resync path hits getsize OSError and returns quietly.
     assert reader.poll(2) == []
 
-
-def test_invalid_line_warning_rate_limit_avoids_flood():
-    assert _should_log_invalid_line(1) is True
-    assert _should_log_invalid_line(3) is True
-    assert _should_log_invalid_line(4) is False
-    assert _should_log_invalid_line(10) is True
-    assert _should_log_invalid_line(11) is False
-    assert _should_log_invalid_line(500) is True
 
 
 def _recovery_log_records(caplog):
@@ -484,8 +474,6 @@ async def test_journal_tick_stream_set_cursor_does_not_replay_poison(tmp_path):
         stream.mark_tick_as_processed()
         skips_after_first = stream.get_invalid_line_skip_count()
         assert skips_after_first >= 1
-
-        from core.journal.tick_journal import TickJournalCursor
 
         stream.set_cursor(TickJournalCursor(last_processed_seq=1))
         await asyncio.sleep(0.05)

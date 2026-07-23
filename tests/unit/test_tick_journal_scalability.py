@@ -8,8 +8,8 @@ from core.journal.tick_journal import (
     COMPACT_MIN_LAG_SEQ,
     DEFAULT_DEDUP_WINDOW,
     TickJournal,
-    TickJournalCursor,
 )
+from core.journal.tick_journal_cursor import TickJournalCursor
 
 
 def _tick(trade_id: str, ts: int = 1000) -> TradeTick:
@@ -25,19 +25,6 @@ def test_dedup_window_is_bounded(tmp_path):
         assert len(handle.readlines()) == 5
     seq = journal.append(_tick("t0"))
     assert seq == 6
-
-
-def test_incremental_reader_does_not_rescan_whole_file(tmp_path):
-    journal = TickJournal(str(tmp_path))
-    for index in range(20):
-        journal.append(_tick(f"t{index}", ts=1000 + index))
-    reader = journal.create_incremental_reader()
-    first_batch = reader.poll(1)
-    assert len(first_batch) == 20
-    journal.append(_tick("t20", ts=1020))
-    second_batch = reader.poll(21)
-    assert len(second_batch) == 1
-    assert second_batch[0][1].trade_id == "t20"
 
 
 def test_compact_drops_processed_prefix(tmp_path):

@@ -13,11 +13,8 @@ import time
 from typing import AsyncIterator, Awaitable, Callable, List, Optional
 
 from core.interfaces.base import IExchangeStream, IPriceObserver
-from core.journal.tick_journal import (
-    DEFAULT_EMPTY_POLL_DIAGNOSTIC_SECONDS,
-    TickJournal,
-    TickJournalCursor,
-)
+from core.journal.tick_journal import DEFAULT_EMPTY_POLL_DIAGNOSTIC_SECONDS, TickJournal
+from core.journal.tick_journal_cursor import TickJournalCursor
 from leviathan_common.models.trade_tick import TradeTick
 
 logger = logging.getLogger(__name__)
