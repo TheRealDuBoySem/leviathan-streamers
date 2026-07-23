@@ -1,10 +1,13 @@
+"""TickJournal facade unit tests (append, cursor, handoff, validation)."""
+
 import os
 
 import pytest
 
-from leviathan_common.models.trade_tick import TradeTick
 from core.journal.tick_journal import TickJournal
 from core.journal.tick_journal_cursor import TickJournalCursor
+from core.journal.tick_journal_meta import TickJournalMetaStore
+from leviathan_common.models.trade_tick import TradeTick
 
 
 def _tick(trade_id: str, ts: int = 1000) -> TradeTick:
@@ -86,7 +89,11 @@ def test_tick_journal_tail_from_rejects_negative_start_seq(tmp_path):
 def test_tick_journal_read_latest_seq_from_disk_falls_back_on_corrupt_meta(tmp_path, mocker):
     journal = TickJournal(str(tmp_path))
     journal.append(_tick("t1"))
-    mocker.patch.object(journal, "_TickJournal__load_meta", side_effect=OSError("bad meta"))
+    mocker.patch.object(
+        TickJournalMetaStore,
+        "load_payload",
+        side_effect=OSError("bad meta"),
+    )
     assert journal.read_latest_seq_from_disk() == journal.latest_seq()
 
 

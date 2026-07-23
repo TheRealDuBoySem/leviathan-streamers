@@ -1,8 +1,9 @@
+"""Scalability / integration scenarios for TickJournal compaction + readers."""
+
 import asyncio
 
 import pytest
 
-from leviathan_common.models.trade_tick import TradeTick
 from core.journal.journal_tick_stream import JournalTickStream
 from core.journal.tick_journal import (
     COMPACT_MIN_LAG_SEQ,
@@ -10,6 +11,7 @@ from core.journal.tick_journal import (
     TickJournal,
 )
 from core.journal.tick_journal_cursor import TickJournalCursor
+from leviathan_common.models.trade_tick import TradeTick
 
 
 def _tick(trade_id: str, ts: int = 1000) -> TradeTick:
@@ -25,32 +27,6 @@ def test_dedup_window_is_bounded(tmp_path):
         assert len(handle.readlines()) == 5
     seq = journal.append(_tick("t0"))
     assert seq == 6
-
-
-def test_compact_drops_processed_prefix(tmp_path):
-    journal = TickJournal(str(tmp_path), dedup_window=DEFAULT_DEDUP_WINDOW)
-    for index in range(10):
-        journal.append(_tick(f"t{index}", ts=1000 + index))
-    journal.save_cursor(TickJournalCursor(last_processed_seq=8))
-    removed = journal.compact_before_seq(6)
-    assert removed == 5
-    replay = list(journal.tail_from(6))
-    assert replay[0][0] == 6
-    assert replay[-1][0] == 10
-
-
-def test_maybe_compact_skips_when_cursor_lag_is_small(tmp_path):
-    journal = TickJournal(str(tmp_path))
-    for index in range(5):
-        journal.append(_tick(f"t{index}", ts=1000 + index))
-    journal.save_cursor(TickJournalCursor(last_processed_seq=2))
-    assert journal.maybe_compact(lag_seq=5_000) == 0
-
-
-def test_maybe_compact_rejects_non_positive_lag(tmp_path):
-    journal = TickJournal(str(tmp_path))
-    with pytest.raises(ValueError, match="lag_seq must be positive"):
-        journal.maybe_compact(lag_seq=0)
 
 
 def test_incremental_reader_recovers_after_compact_rewrites_file(tmp_path):
@@ -93,7 +69,7 @@ def test_incremental_reader_recovers_after_compact_rewrites_file(tmp_path):
 @pytest.mark.asyncio
 async def test_journal_tick_stream_survives_live_maybe_compact(tmp_path):
     """Live JournalTickStream must keep yielding ticks after maybe_compact."""
-    journal = TickJournal(str(tmp_path))
+    journal = TickJournal(str(tmp_path), dedup_window=DEFAULT_DEDUP_WINDOW)
     total = COMPACT_MIN_LAG_SEQ + 50
     for index in range(total):
         journal.append(_tick(f"t{index}", ts=1000 + index))

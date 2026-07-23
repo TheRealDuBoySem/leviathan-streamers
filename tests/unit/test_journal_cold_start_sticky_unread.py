@@ -19,11 +19,22 @@ import os
 import pytest
 
 from core.journal.journal_incremental_reader import JournalIncrementalReader
+from core.journal.journal_io import atomic_write_json
 from core.journal.journal_tick_stream import JournalTickStream
 from core.journal.tick_journal import TickJournal
 from core.journal.tick_journal_codec import tick_to_dict
 from core.journal.tick_journal_cursor import TickJournalCursor
 from leviathan_common.models.trade_tick import TradeTick
+
+
+def _seed_journal_meta(journal, tmp_path, *, latest_seq, seq_index=None):
+    payload = {
+        "latest_seq": latest_seq,
+        "seen_trade_ids": {},
+        "seq_index": [[0, 0]] if seq_index is None else seq_index,
+    }
+    atomic_write_json(str(tmp_path / "tick_journal.meta.json"), payload)
+    journal.reload_meta_from_disk()
 
 
 def _tick(trade_id: str, ts: int = 1000) -> TradeTick:
@@ -60,8 +71,7 @@ def test_reset_from_seq_abandons_incomplete_tip_so_next_append_is_clean(tmp_path
     with open(journal.journal_path, "w", encoding="utf-8") as handle:
         handle.write(complete)
         handle.write(torn)
-    journal._TickJournal__meta["latest_seq"] = 1
-    journal.flush_meta()
+    _seed_journal_meta(journal, tmp_path, latest_seq=1)
 
     reader = JournalIncrementalReader(
         journal,
@@ -114,7 +124,7 @@ def test_reader_abandons_stuck_incomplete_after_timeout_without_waiting_for_pois
     assert snapshot["incomplete_stuck"] is False
 
     # Append a complete record after the abandoned tip (collector path).
-    journal._TickJournal__meta["latest_seq"] = 1
+    _seed_journal_meta(journal, tmp_path, latest_seq=1)
     seq = journal.append(_tick("fresh", ts=1200))
     assert seq == 2
 
@@ -171,8 +181,7 @@ def test_read_progress_snapshot_latest_seq_not_stale_vs_reader_progress(tmp_path
     journal.append(_tick("b"))
     journal.append(_tick("c"))
     # Persist a stale watermark while the file already holds seq 1..3.
-    journal._TickJournal__meta["latest_seq"] = 1
-    journal.flush_meta()
+    _seed_journal_meta(journal, tmp_path, latest_seq=1)
 
     reader = JournalIncrementalReader(journal)
     assert [seq for seq, _ in reader.poll(1)] == [1, 2, 3]
@@ -194,8 +203,7 @@ def test_read_progress_snapshot_coerces_production_stale_meta_watermark(tmp_path
     journal = TickJournal(str(tmp_path))
     journal.append(_tick("seed"))
     # Force the exact stale disk tip seen in 2026-07-17 logs.
-    journal._TickJournal__meta["latest_seq"] = stale_watermark
-    journal.flush_meta()
+    _seed_journal_meta(journal, tmp_path, latest_seq=stale_watermark)
     assert journal.read_latest_seq_from_disk() == stale_watermark
 
     reader = JournalIncrementalReader(journal)
@@ -326,8 +334,7 @@ async def test_set_cursor_cold_attach_consumes_new_ticks_despite_torn_tip(tmp_pa
         handle.write(_record_line(1, "prior") + "\n")
         # Prod-shaped torn suffix without newline (hour-00 gen195 unlock shape).
         handle.write('96960"}}')
-    journal._TickJournal__meta["latest_seq"] = 1
-    journal.flush_meta()
+    _seed_journal_meta(journal, tmp_path, latest_seq=1)
 
     stream = JournalTickStream(journal, poll_interval_seconds=0.01)
     stream.set_cursor(TickJournalCursor(last_processed_seq=1))

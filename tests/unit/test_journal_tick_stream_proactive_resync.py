@@ -14,11 +14,22 @@ import os
 import pytest
 
 from core.journal.journal_incremental_reader import JournalIncrementalReader
+from core.journal.journal_io import atomic_write_json
 from core.journal.journal_tick_stream import JournalTickStream
 from core.journal.tick_journal import TickJournal
 from core.journal.tick_journal_codec import tick_to_dict
 from core.journal.tick_journal_cursor import TickJournalCursor
 from leviathan_common.models.trade_tick import TradeTick
+
+
+def _seed_journal_meta(journal, tmp_path, *, latest_seq, seq_index=None):
+    payload = {
+        "latest_seq": latest_seq,
+        "seen_trade_ids": {},
+        "seq_index": [[0, 0]] if seq_index is None else seq_index,
+    }
+    atomic_write_json(str(tmp_path / "tick_journal.meta.json"), payload)
+    journal.reload_meta_from_disk()
 
 
 def _tick(trade_id: str, ts: int = 1000) -> TradeTick:
@@ -99,8 +110,7 @@ def test_force_tail_resync_if_unread_clears_incomplete_tip_and_reads_next(
     with open(journal.journal_path, "a", encoding="utf-8") as handle:
         # Finish a fresh complete record after the abandoned tear (new line).
         handle.write("\n" + _record_line(2, "fresh", ts=2000) + "\n")
-    journal._TickJournal__meta["latest_seq"] = 2
-    journal.flush_meta()
+    _seed_journal_meta(journal, tmp_path, latest_seq=2)
 
     records = reader.poll(2)
     assert len(records) == 1
