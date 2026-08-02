@@ -7,7 +7,11 @@ _original_sleep = asyncio.sleep
 async def mock_sleep_yield(delay):
     await _original_sleep(0)
 
-from core.network.reconnecting_ws_manager import ReconnectingWebSocketManager, MaxRetriesExceededError
+from core.network.reconnecting_ws_manager import (
+    ReconnectingWebSocketManager,
+    MaxRetriesExceededError,
+    log_reconnect_countdown,
+)
 from core.network.retry_policy import RetryPolicy
 from core.network.silence_watchdog import SilenceWatchdog
 from core.network.keep_alive_emitter import KeepAliveEmitter
@@ -399,6 +403,120 @@ async def test_connection_closed_logs_absent_when_no_close_frames(caplog):
     assert "WebSocket fermé" in warning_text
     assert "close code/reason absent" in warning_text
     assert "Unknown" not in warning_text
+
+
+@pytest.mark.asyncio
+async def test_connection_closed_logs_emitted_before_context_exit_blocks(caplog):
+    import logging
+    from websockets.exceptions import ConnectionClosed
+    from core.interfaces.heartbeat import IHeartbeat
+    from core.interfaces.watchdog import IWatchdog
+
+    exit_block = asyncio.Event()
+
+    class NoopWatchdog(IWatchdog):
+        def ping(self) -> None:
+            return None
+
+        def check_health(self) -> bool:
+            return True
+
+    class NoopHeartbeat(IHeartbeat):
+        async def run(self, send_func, payload: str = "ping") -> None:
+            await asyncio.Event().wait()
+
+    class BlockingExitWS:
+        def __init__(self):
+            self.send = AsyncMock()
+            self.close = AsyncMock()
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc_val, exc_tb):
+            await exit_block.wait()
+
+        async def __aiter__(self):
+            raise ConnectionClosed(None, None)
+            yield  # pragma: no cover
+
+    mgr = ReconnectingWebSocketManager(
+        "ws://t",
+        RetryPolicy(max_retries=1, max_delay=0),
+        NoopWatchdog(),
+        NoopHeartbeat(),
+    )
+
+    async def _consume():
+        async for _ in mgr.start_connection_and_listen():
+            pass  # pragma: no cover
+
+    with patch("websockets.connect", return_value=BlockingExitWS()):
+        with caplog.at_level(logging.DEBUG):
+            task = asyncio.create_task(_consume(), name="consume-ws")
+            try:
+                for _ in range(10):
+                    await asyncio.sleep(0)
+
+                warning_messages = [
+                    r.message
+                    for r in caplog.records
+                    if r.levelno == logging.WARNING and "WebSocket fermé" in r.message
+                ]
+                debug_messages = [
+                    r.message
+                    for r in caplog.records
+                    if r.levelno == logging.DEBUG
+                    and "preparing reconnect" in r.message
+                ]
+                assert warning_messages, (
+                    "Expected close warning before context exit unblocks"
+                )
+                assert debug_messages, "Expected preparing reconnect debug log"
+
+                exit_block.set()
+                with pytest.raises(MaxRetriesExceededError):
+                    await task
+            finally:
+                exit_block.set()
+                if not task.done():
+                    task.cancel()
+                    with pytest.raises(asyncio.CancelledError):
+                        await task
+
+
+def test_log_reconnect_countdown_includes_since_close_ms(caplog):
+    import logging
+
+    with caplog.at_level(logging.INFO):
+        log_reconnect_countdown(
+            1.5,
+            reconnect_seq=9,
+            last_close_mono_ms=1000,
+            now_monotonic_ms=lambda: 1250,
+        )
+
+    assert any(
+        "Reconnexion dans 1.5s... seq=9 since_close_ms=250" in r.message
+        for r in caplog.records
+    )
+
+
+def test_log_reconnect_countdown_without_close_mono(caplog):
+    import logging
+
+    with caplog.at_level(logging.INFO):
+        log_reconnect_countdown(
+            0,
+            reconnect_seq=3,
+            last_close_mono_ms=None,
+            now_monotonic_ms=lambda: 0,
+        )
+
+    assert any(
+        r.message == "Reconnexion dans 0s... seq=3" for r in caplog.records
+    )
+    assert all("since_close_ms=" not in r.message for r in caplog.records)
 
 
 @pytest.mark.asyncio

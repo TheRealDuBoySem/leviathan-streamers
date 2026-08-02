@@ -4,6 +4,7 @@ import asyncio
 import inspect
 import logging
 import sys
+import time
 from typing import Any, Optional, AsyncGenerator, Callable, Awaitable, Dict
 
 import websockets
@@ -49,6 +50,32 @@ def format_websocket_close_diagnostic(exc: Any) -> str:
     if sent is not None:
         return _format_close_frame(sent, source="sent")
     return _ABSENT_CLOSE_DIAGNOSTIC
+
+
+def log_reconnect_countdown(
+    delay: float,
+    reconnect_seq: int,
+    last_close_mono_ms: Optional[int],
+    *,
+    now_monotonic_ms: Callable[[], int],
+) -> None:
+    """
+    Log the reconnect delay with a stable close→reconnect chronology.
+
+    When ``last_close_mono_ms`` is known (ConnectionClosed path), include
+    ``since_close_ms`` derived from a monotonic clock so wall-clock skew cannot
+    invert close/reconnect ordering in the logs.
+    """
+    if last_close_mono_ms is not None:
+        since_close_ms = now_monotonic_ms() - last_close_mono_ms
+        logger.info(
+            "Reconnexion dans %ss... seq=%s since_close_ms=%s",
+            delay,
+            reconnect_seq,
+            since_close_ms,
+        )
+        return
+    logger.info("Reconnexion dans %ss... seq=%s", delay, reconnect_seq)
 
 
 class MaxRetriesExceededError(Exception):
@@ -159,6 +186,17 @@ class ReconnectingWebSocketManager:
         self.__on_connect_callback: Optional[Callable[[], Awaitable[None]]] = None
         self.__health_task: Optional[asyncio.Task] = None
         self.__keep_alive_task: Optional[asyncio.Task] = None
+        self.__log_seq = 0
+
+    def __next_log_seq(self) -> int:
+        self.__log_seq += 1
+        return self.__log_seq
+
+    def __now_wall_ms(self) -> int:
+        return time.time_ns() // 1_000_000
+
+    def __now_monotonic_ms(self) -> int:
+        return time.monotonic_ns() // 1_000_000
 
     @property
     def url(self) -> str:
@@ -341,16 +379,32 @@ class ReconnectingWebSocketManager:
                 self.__stop_event.set()
                 raise MaxRetriesExceededError("Connexion impossible.")
 
-            logger.info(f"Connexion à {self.__url} (Tentative {attempt + 1})...")
+            attempt_seq = self.__next_log_seq()
+            logger.info(
+                "Connexion à %s (Tentative %s) seq=%s event_ts_ms=%s event_mono_ms=%s",
+                self.__url,
+                attempt + 1,
+                attempt_seq,
+                self.__now_wall_ms(),
+                self.__now_monotonic_ms(),
+            )
             connect_ctx = None
             health_task = None
             keep_alive_task = None
+            last_close_wall_ms: Optional[int] = None
+            last_close_mono_ms: Optional[int] = None
 
             try:
                 connect_ctx, ws = await self.__open_websocket_connection()
                 try:
                     self.__ws = ws
-                    logger.info("WebSocket connecté avec succès.")
+                    connected_seq = self.__next_log_seq()
+                    logger.info(
+                        "WebSocket connecté avec succès seq=%s event_ts_ms=%s event_mono_ms=%s",
+                        connected_seq,
+                        self.__now_wall_ms(),
+                        self.__now_monotonic_ms(),
+                    )
                     logger.debug(
                         "WebSocket session started url=%s",
                         self.__url,
@@ -368,15 +422,30 @@ class ReconnectingWebSocketManager:
                     if self.__on_connect_callback:
                         await self.__on_connect_callback()
 
-                    async for message in ws:
-                        self.__watchdog.ping()
-                        yield message
+                    try:
+                        async for message in ws:
+                            self.__watchdog.ping()
+                            yield message
+                    except ConnectionClosed as e:
+                        last_close_wall_ms = self.__now_wall_ms()
+                        last_close_mono_ms = self.__now_monotonic_ms()
+                        close_seq = self.__next_log_seq()
+                        diagnostic = format_websocket_close_diagnostic(e)
+                        logger.warning(
+                            "WebSocket fermé seq=%s event_ts_ms=%s event_mono_ms=%s (%s).",
+                            close_seq,
+                            last_close_wall_ms,
+                            last_close_mono_ms,
+                            diagnostic,
+                        )
+                        preparing_seq = self.__next_log_seq()
+                        logger.debug(
+                            "WebSocket connection closed; preparing reconnect seq=%s close_event_mono_ms=%s",
+                            preparing_seq,
+                            last_close_mono_ms,
+                        )
                 finally:
                     await self.__close_websocket_connection(connect_ctx)
-            except ConnectionClosed as e:
-                diagnostic = format_websocket_close_diagnostic(e)
-                logger.warning("WebSocket fermé (%s).", diagnostic)
-                logger.debug("WebSocket connection closed; preparing reconnect")
             except Exception as e:
                 logger.error(f"Erreur réseau: {e}")
             finally:
@@ -388,7 +457,13 @@ class ReconnectingWebSocketManager:
 
             if not self.__stop_event.is_set():
                 delay = self.__retry_policy.get_delay(attempt)
-                logger.info(f"Reconnexion dans {delay}s...")
+                reconnect_seq = self.__next_log_seq()
+                log_reconnect_countdown(
+                    delay,
+                    reconnect_seq,
+                    last_close_mono_ms,
+                    now_monotonic_ms=self.__now_monotonic_ms,
+                )
                 try:
                     await asyncio.wait_for(self.__stop_event.wait(), timeout=delay)
                 except asyncio.TimeoutError:
