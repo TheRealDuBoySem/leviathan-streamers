@@ -520,12 +520,13 @@ def test_log_reconnect_countdown_without_close_mono(caplog):
 
 
 @pytest.mark.asyncio
-async def test_flap_emits_post_flap_correlation_and_tip_stale(caplog):
-    """WATCH Day19 #2: close→reconnect logs tip correlation; frozen tip → WARNING."""
+async def test_flap_emits_post_flap_correlation_and_tip_stale_heal(caplog):
+    """BB-B5-A1: close→reconnect logs tip correlation; frozen tip → CRITICAL + on_stale."""
     import logging
     from websockets.exceptions import ConnectionClosed
 
     tip = {"seq": 1_684_815}
+    stale_calls: list[tuple[int, int, float]] = []
     mgr = ReconnectingWebSocketManager(
         "wss://example/ws/public",
         RetryPolicy(max_retries=2, max_delay=0),
@@ -533,7 +534,11 @@ async def test_flap_emits_post_flap_correlation_and_tip_stale(caplog):
         KeepAliveEmitter(interval_seconds=60.0),
     )
     mgr.set_tip_seq_provider(lambda: tip["seq"])
+    mgr.set_on_post_flap_tip_stale(
+        lambda before, now, elapsed: stale_calls.append((before, now, elapsed))
+    )
     mgr.flap_tip_monitor.set_stale_window_seconds(0.05)
+    mgr.flap_tip_monitor.set_min_heal_interval_seconds(0.0)
 
     phase = {"n": 0}
     reconnected = asyncio.Event()
@@ -562,9 +567,11 @@ async def test_flap_emits_post_flap_correlation_and_tip_stale(caplog):
 
     assert any("post_flap_correlation" in r.message for r in caplog.records)
     assert any(
-        "post_flap_tip_stale" in r.message and r.levelno == logging.WARNING
+        "post_flap_tip_stale" in r.message and r.levelno >= logging.CRITICAL
         for r in caplog.records
     )
+    assert len(stale_calls) == 1
+    assert stale_calls[0][:2] == (1_684_815, 1_684_815)
     correlation = next(
         r.message for r in caplog.records if "post_flap_correlation" in r.message
     )

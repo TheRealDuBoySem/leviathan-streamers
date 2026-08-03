@@ -121,6 +121,8 @@ class BaseExchangeStream(IExchangeStream, ABC):
         self.__observers: List[IPriceObserver] = []
         self.__on_reconnect_callbacks: List[Callable[[], Awaitable[None]]] = []
         self.__write_liveness_guard = write_liveness_guard
+        # 1-based: incremented on every WS connect (1 = first boot / post-OS).
+        self.__connect_generation = 0
         self.__confirmation_tracker = SubscriptionConfirmationTracker(
             timeout_seconds=confirmation_timeout_seconds,
             on_complete=self.__on_subscriptions_confirmed,
@@ -133,7 +135,8 @@ class BaseExchangeStream(IExchangeStream, ABC):
         """
         Bind tip-seq sampling for post-flap correlation when a journal is reachable.
 
-        Complements BB-B5-A1 write-liveness: telemetry only (WATCH Day19 #2).
+        Complements BB-B5-A1 write-liveness; tip-stale heal callback is wired by
+        the collector entrypoint (``set_on_post_flap_tip_stale``).
         """
         set_provider = getattr(self.__network_manager, "set_tip_seq_provider", None)
         if not callable(set_provider):
@@ -160,19 +163,33 @@ class BaseExchangeStream(IExchangeStream, ABC):
         return _tip_seq_provider
 
     def __on_subscriptions_confirmed(self, confirmed: Set[str]) -> None:
-        """Log full ack, then arm post-reconnect journal write-liveness (BB-B5-A1)."""
+        """Log full ack, then arm journal write-liveness (first boot + reconnect).
+
+        Day20 WATCH #3: never skip connect_generation=1 (post-OS tip mute).
+        """
+        connect_generation = self.__connect_generation
+        first_boot = connect_generation <= 1
         logger.info(
-            "Abonnements confirmés après reconnect: demandés=%s, confirmés=%s",
+            "Abonnements confirmés après reconnect: demandés=%s, confirmés=%s "
+            "connect_generation=%s first_boot=%s",
             sorted(confirmed),
             sorted(confirmed),
+            connect_generation,
+            first_boot,
         )
         if self.__write_liveness_guard is not None:
-            self.__write_liveness_guard.arm_after_subscriptions_confirmed(set(confirmed))
+            # Always arm — including first confirm after OS restart / fresh collector.
+            self.__write_liveness_guard.arm_after_subscriptions_confirmed(
+                set(confirmed),
+                connect_generation=max(connect_generation, 1),
+            )
 
     async def __handle_connect(self) -> None:
         """Notifies reconnect listeners before resubscribing so backfill session state is reset first."""
+        self.__connect_generation += 1
         if self.__write_liveness_guard is not None:
-            # Drop any prior write deadline; re-arm only after the new confirms.
+            # Drop any prior write deadline; re-arm only after the new confirms
+            # (including the first confirm of this connect generation).
             self.__write_liveness_guard.cancel()
         for callback in list(self.__on_reconnect_callbacks):
             try:
@@ -243,6 +260,11 @@ class BaseExchangeStream(IExchangeStream, ABC):
     def write_liveness_guard(self) -> Optional[PostReconnectWriteLivenessGuard]:
         """Return the optional post-reconnect journal write-liveness guard."""
         return self.__write_liveness_guard
+
+    @property
+    def connect_generation(self) -> int:
+        """Return 1-based WS connect count (0 before first connect)."""
+        return self.__connect_generation
 
     # Pattern: Observer (Observable part)
     def attach_observer(self, observer: IPriceObserver) -> None:

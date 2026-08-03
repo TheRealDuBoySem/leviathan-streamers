@@ -1,12 +1,15 @@
-"""TDD: post-flap tip-seq correlation telemetry (WATCH Day19 #2)."""
+"""TDD: post-flap tip-seq correlation + heal (BB-B5-A1 / flap-without-heal)."""
 from __future__ import annotations
 
 import asyncio
 import logging
+import time
 
 import pytest
 
 from core.network.post_flap_tip_correlation import (
+    COLLECTOR_POST_FLAP_TIP_STALE_EXIT_CODE,
+    DEFAULT_MIN_HEAL_INTERVAL_SECONDS,
     DEFAULT_POST_FLAP_TIP_STALE_SECONDS,
     PostFlapTipCorrelationMonitor,
 )
@@ -14,10 +17,14 @@ from core.network.reconnecting_ws_manager import ReconnectingWebSocketManager
 from core.network.retry_policy import RetryPolicy
 from core.network.silence_watchdog import SilenceWatchdog
 from core.network.keep_alive_emitter import KeepAliveEmitter
+from core.state.post_reconnect_write_liveness import COLLECTOR_WRITE_LIVENESS_EXIT_CODE
 
 
-def test_defaults_are_reasonable():
+def test_defaults_are_reasonable_and_exit_code_nonzero():
     assert DEFAULT_POST_FLAP_TIP_STALE_SECONDS == 30.0
+    assert DEFAULT_MIN_HEAL_INTERVAL_SECONDS == 120.0
+    assert COLLECTOR_POST_FLAP_TIP_STALE_EXIT_CODE == 1
+    assert COLLECTOR_POST_FLAP_TIP_STALE_EXIT_CODE == COLLECTOR_WRITE_LIVENESS_EXIT_CODE
 
 
 def test_monitor_rejects_invalid_stale_window():
@@ -25,6 +32,23 @@ def test_monitor_rejects_invalid_stale_window():
         PostFlapTipCorrelationMonitor(stale_window_seconds="slow")  # type: ignore[arg-type]
     with pytest.raises(ValueError, match="stale_window_seconds must be > 0"):
         PostFlapTipCorrelationMonitor(stale_window_seconds=0)
+    with pytest.raises(ValueError, match="min_heal_interval_seconds must be >= 0"):
+        PostFlapTipCorrelationMonitor(min_heal_interval_seconds=-1)
+    with pytest.raises(TypeError, match="min_heal_interval_seconds must be a number"):
+        PostFlapTipCorrelationMonitor(min_heal_interval_seconds="x")  # type: ignore[arg-type]
+    with pytest.raises(TypeError, match="on_stale must be callable"):
+        PostFlapTipCorrelationMonitor(on_stale=object())  # type: ignore[arg-type]
+
+
+def test_min_heal_interval_property_and_setter_validate():
+    monitor = PostFlapTipCorrelationMonitor(min_heal_interval_seconds=12.5)
+    assert monitor.min_heal_interval_seconds == 12.5
+    with pytest.raises(TypeError, match="min_heal_interval_seconds must be a number"):
+        monitor.set_min_heal_interval_seconds("bad")  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="min_heal_interval_seconds must be >= 0"):
+        monitor.set_min_heal_interval_seconds(-0.1)
+    monitor.set_min_heal_interval_seconds(0.0)
+    assert monitor.min_heal_interval_seconds == 0.0
 
 
 def test_set_stale_window_seconds_validates():
@@ -39,6 +63,14 @@ def test_set_tip_seq_provider_rejects_non_callable():
     monitor = PostFlapTipCorrelationMonitor()
     with pytest.raises(TypeError, match="tip_seq_provider must be callable"):
         monitor.set_tip_seq_provider(123)  # type: ignore[arg-type]
+
+
+def test_set_on_stale_rejects_non_callable():
+    monitor = PostFlapTipCorrelationMonitor()
+    with pytest.raises(TypeError, match="on_stale must be callable"):
+        monitor.set_on_stale(123)  # type: ignore[arg-type]
+    monitor.set_on_stale(None)
+    monitor.set_on_stale(lambda *_: None)
 
 
 def test_first_connect_without_prior_close_is_noop(caplog):
@@ -90,26 +122,84 @@ async def test_flap_logs_structured_correlation_with_tip_before_after(caplog):
 
 
 @pytest.mark.asyncio
-async def test_post_flap_tip_stale_warning_when_tip_frozen(caplog):
+async def test_post_flap_tip_stale_invokes_on_stale_heal_callback(caplog):
+    """BB-B5-A1: frozen tip after flap is fail-fast (CRITICAL + on_stale), not telemetry-only."""
     tip = {"seq": 42}
+    stale_calls: list[tuple[int, int, float]] = []
     monitor = PostFlapTipCorrelationMonitor(
         tip_seq_provider=lambda: tip["seq"],
         stale_window_seconds=0.05,
         url="wss://example/ws/public",
+        on_stale=lambda before, now, elapsed: stale_calls.append((before, now, elapsed)),
+        min_heal_interval_seconds=0.0,
     )
     monitor.note_connection_closed(close_wall_ms=10, close_mono_ms=1)
     monitor.note_connection_restored(reconnect_wall_ms=20, reconnect_mono_ms=11)
 
-    with caplog.at_level(logging.WARNING):
+    with caplog.at_level(logging.CRITICAL):
         await asyncio.sleep(0.12)
 
+    assert len(stale_calls) == 1
+    assert stale_calls[0][0] == 42
+    assert stale_calls[0][1] == 42
+    assert stale_calls[0][2] >= 0.04
     assert any(
-        "post_flap_tip_stale" in r.message and r.levelno == logging.WARNING
+        "post_flap_tip_stale" in r.message and r.levelno >= logging.CRITICAL
         for r in caplog.records
     )
     stale = next(r.message for r in caplog.records if "post_flap_tip_stale" in r.message)
     assert "tip_seq=42" in stale
     assert "tip_seq_before=42" in stale
+    assert f"exit_code={COLLECTOR_POST_FLAP_TIP_STALE_EXIT_CODE}" in stale
+    assert "self-heal" in stale.lower() or "heal" in stale.lower()
+
+
+@pytest.mark.asyncio
+async def test_post_flap_tip_stale_without_callback_still_logs_critical(caplog):
+    tip = {"seq": 7}
+    monitor = PostFlapTipCorrelationMonitor(
+        tip_seq_provider=lambda: tip["seq"],
+        stale_window_seconds=0.05,
+        min_heal_interval_seconds=0.0,
+    )
+    monitor.note_connection_closed(close_wall_ms=1, close_mono_ms=1)
+    monitor.note_connection_restored(reconnect_wall_ms=2, reconnect_mono_ms=2)
+
+    with caplog.at_level(logging.CRITICAL):
+        await asyncio.sleep(0.12)
+
+    assert any(
+        "post_flap_tip_stale" in r.message and r.levelno >= logging.CRITICAL
+        for r in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_min_heal_interval_suppresses_repeated_on_stale(caplog):
+    tip = {"seq": 3}
+    stale_calls: list[object] = []
+    monitor = PostFlapTipCorrelationMonitor(
+        tip_seq_provider=lambda: tip["seq"],
+        stale_window_seconds=0.05,
+        min_heal_interval_seconds=60.0,
+        on_stale=lambda *_: stale_calls.append(time.monotonic()),
+    )
+    monitor.note_connection_closed(close_wall_ms=1, close_mono_ms=1)
+    monitor.note_connection_restored(reconnect_wall_ms=2, reconnect_mono_ms=2)
+    with caplog.at_level(logging.WARNING):
+        await asyncio.sleep(0.12)
+    assert len(stale_calls) == 1
+
+    monitor.note_connection_closed(close_wall_ms=3, close_mono_ms=3)
+    monitor.note_connection_restored(reconnect_wall_ms=4, reconnect_mono_ms=4)
+    with caplog.at_level(logging.WARNING):
+        await asyncio.sleep(0.12)
+
+    assert len(stale_calls) == 1
+    assert any(
+        "cooldown" in r.message.lower() or "heal interval" in r.message.lower()
+        for r in caplog.records
+    )
 
 
 @pytest.mark.asyncio
@@ -285,13 +375,49 @@ async def test_stale_elapsed_ms_falls_back_when_wall_clock_raises(caplog):
         tip_seq_provider=lambda: tip["seq"],
         stale_window_seconds=0.05,
         now_wall_ms=_wall,
+        min_heal_interval_seconds=0.0,
     )
     monitor.note_connection_closed(close_wall_ms=10, close_mono_ms=1)
     monitor.note_connection_restored(reconnect_wall_ms=20, reconnect_mono_ms=11)
-    with caplog.at_level(logging.WARNING):
+    with caplog.at_level(logging.CRITICAL):
         await asyncio.sleep(0.12)
     stale = next(r.message for r in caplog.records if "post_flap_tip_stale" in r.message)
     assert "elapsed_since_reconnect_ms=50" in stale  # window_s * 1000 fallback
+
+
+def test_manager_set_on_post_flap_tip_stale_rejects_non_callable():
+    mgr = ReconnectingWebSocketManager(
+        "wss://example/ws/public",
+        RetryPolicy(max_retries=1),
+        SilenceWatchdog(),
+        KeepAliveEmitter(),
+    )
+    with pytest.raises(TypeError, match="on_stale must be callable"):
+        mgr.set_on_post_flap_tip_stale(object())  # type: ignore[arg-type]
+    mgr.set_on_post_flap_tip_stale(None)
+
+
+@pytest.mark.asyncio
+async def test_manager_post_flap_tip_stale_callback_fires():
+    mgr = ReconnectingWebSocketManager(
+        "wss://example/ws/public",
+        RetryPolicy(max_retries=1),
+        SilenceWatchdog(),
+        KeepAliveEmitter(),
+    )
+    tip = {"seq": 99}
+    stale_calls: list[tuple[int, int, float]] = []
+    mgr.set_tip_seq_provider(lambda: tip["seq"])
+    mgr.set_on_post_flap_tip_stale(
+        lambda before, now, elapsed: stale_calls.append((before, now, elapsed))
+    )
+    mgr.flap_tip_monitor.set_stale_window_seconds(0.05)
+    mgr.flap_tip_monitor.set_min_heal_interval_seconds(0.0)
+    mgr.flap_tip_monitor.note_connection_closed(close_wall_ms=1, close_mono_ms=1)
+    mgr.flap_tip_monitor.note_connection_restored(reconnect_wall_ms=2, reconnect_mono_ms=2)
+    await asyncio.sleep(0.12)
+    assert len(stale_calls) == 1
+    assert stale_calls[0][:2] == (99, 99)
 
 
 @pytest.mark.asyncio

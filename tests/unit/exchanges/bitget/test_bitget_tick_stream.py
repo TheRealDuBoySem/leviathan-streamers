@@ -868,6 +868,70 @@ async def test_full_confirmation_arms_write_liveness_then_stale_without_writes(
     assert stream.write_liveness_guard is guard
 
 
+@pytest.mark.asyncio
+async def test_first_boot_confirm_arms_write_liveness_mute_tip_heal(
+    mocker, mock_ws_manager, mock_parser, caplog
+):
+    """Day20 WATCH #3: first connect post-OS (connect_generation=1) must arm + heal.
+
+    Mirrors H06: WS public UP + sub confirmed, tip frozen → collector self-heal.
+    """
+    import logging
+
+    from core.state.post_reconnect_write_liveness import PostReconnectWriteLivenessGuard
+
+    stale_calls: list[set[str]] = []
+    guard = PostReconnectWriteLivenessGuard(
+        timeout_seconds=0.05,
+        min_heal_interval_seconds=0.0,
+        on_stale=lambda symbols, _elapsed: stale_calls.append(set(symbols)),
+    )
+
+    captured, original = _capture_on_connect_callback(mock_ws_manager)
+    stream = BitgetTickStream(
+        network_manager=mock_ws_manager,
+        subscription_strategy=BitgetSubscriptionProtocol(inst_type="mc"),
+        parsing_strategy=mock_parser,
+        dispatch_strategy=AsyncQueueDispatcher(),
+        symbols=["XRPUSDT"],
+        confirmation_timeout_seconds=1.0,
+        write_liveness_guard=guard,
+    )
+    mock_ws_manager.set_on_connect_callback = original
+    mocker.patch(
+        "core.network.reconnecting_ws_manager.ReconnectingWebSocketManager.send",
+        new_callable=AsyncMock,
+    )
+    # First boot only — no prior reconnect cycle.
+    assert stream.connect_generation == 0
+    await captured[0]()
+    assert stream.connect_generation == 1
+
+    async def mock_listen():
+        yield orjson_subscribe_ack("XRPUSDT")
+        await asyncio.sleep(0.15)
+
+    mocker.patch.object(
+        stream.network_manager,
+        "start_connection_and_listen",
+        side_effect=mock_listen,
+    )
+
+    with caplog.at_level(logging.INFO):
+        await stream.start_streaming()
+
+    assert guard.arm_count == 1
+    assert stale_calls == [{"XRPUSDT"}]
+    assert any(
+        "first_boot=True" in record.message or "connect_generation=1" in record.message
+        for record in caplog.records
+    )
+    assert any(
+        record.levelno >= logging.CRITICAL and "BB-B5-A1" in record.message
+        for record in caplog.records
+    )
+
+
 def test_bitget_tick_stream_rejects_invalid_write_liveness_guard(
     mock_ws_manager, mock_parser
 ):

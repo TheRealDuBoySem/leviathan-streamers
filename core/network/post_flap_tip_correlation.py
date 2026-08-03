@@ -1,11 +1,13 @@
 """
-Post-flap tip-seq correlation telemetry (WATCH Day19 #2).
+Post-flap tip-seq correlation + self-heal (BB-B5-A1 / flap-without-heal).
 
-Complements BB-B5-A1 write-liveness (heal on missing journal writes): this module
-only observes and correlates public WS flaps with journal tip progress so ops can
-grep ``post_flap_correlation`` / ``post_flap_tip_stale`` in collector logs.
+Complements write-liveness (heal on missing journal writes after confirm): this
+module correlates public WS flaps with journal tip progress and, when the tip
+does not advance in the observation window, emits ``post_flap_tip_stale`` at
+CRITICAL and invokes ``on_stale`` so the collector can fail-fast (non-zero exit).
 
-Pattern: Observer — samples tip_seq around flap close/reconnect.
+Pattern: Observer — samples tip_seq around flap close/reconnect; Command-like
+heal callback on confirmed tip stagnation.
 """
 from __future__ import annotations
 
@@ -15,11 +17,20 @@ import math
 import time
 from typing import Callable, Optional
 
+from core.state.post_reconnect_write_liveness import (
+    COLLECTOR_WRITE_LIVENESS_EXIT_CODE,
+    DEFAULT_MIN_HEAL_INTERVAL_SECONDS,
+)
+
 logger = logging.getLogger(__name__)
 
 DEFAULT_POST_FLAP_TIP_STALE_SECONDS = 30.0
+# Same non-zero exit as write-liveness so the supervised collector path is uniform.
+COLLECTOR_POST_FLAP_TIP_STALE_EXIT_CODE = COLLECTOR_WRITE_LIVENESS_EXIT_CODE
 
 TipSeqProvider = Callable[[], Optional[int]]
+# tip_seq_before, tip_seq_now, elapsed_seconds_since_reconnect
+OnStaleCallback = Callable[[int, int, float], None]
 
 
 def _format_tip_seq(value: Optional[int]) -> str:
@@ -30,12 +41,18 @@ class PostFlapTipCorrelationMonitor:
     """
     Correlate a public WS flap (close → reconnect) with journal tip progress.
 
+    When tip does not advance within ``stale_window_seconds``, log CRITICAL
+    ``post_flap_tip_stale`` and invoke ``on_stale`` (self-heal), subject to
+    ``min_heal_interval_seconds`` cooldown.
+
     Invariants:
         - At most one post-flap tip-stale watchdog task is scheduled at a time.
         - ``note_connection_restored`` is a no-op unless a prior close was noted
           (first connect is not a flap).
         - Without a tip_seq provider, correlation still logs timestamps but never
-          emits ``post_flap_tip_stale``.
+          emits ``post_flap_tip_stale`` / ``on_stale``.
+        - ``on_stale`` fires at most once per armed generation and respects the
+          min heal interval across generations.
     """
 
     def __init__(
@@ -44,6 +61,8 @@ class PostFlapTipCorrelationMonitor:
         stale_window_seconds: float = DEFAULT_POST_FLAP_TIP_STALE_SECONDS,
         *,
         url: str = "",
+        on_stale: Optional[OnStaleCallback] = None,
+        min_heal_interval_seconds: float = DEFAULT_MIN_HEAL_INTERVAL_SECONDS,
         now_wall_ms: Optional[Callable[[], int]] = None,
         now_mono_ms: Optional[Callable[[], int]] = None,
     ) -> None:
@@ -55,10 +74,18 @@ class PostFlapTipCorrelationMonitor:
             raise ValueError("stale_window_seconds must be > 0")
         if not isinstance(url, str):
             raise TypeError("url must be a string")
+        if on_stale is not None and not callable(on_stale):
+            raise TypeError("on_stale must be callable")
+        if not isinstance(min_heal_interval_seconds, (int, float)):
+            raise TypeError("min_heal_interval_seconds must be a number")
+        if float(min_heal_interval_seconds) < 0:
+            raise ValueError("min_heal_interval_seconds must be >= 0")
 
         self.__tip_seq_provider = tip_seq_provider
         self.__stale_window_seconds = float(stale_window_seconds)
         self.__url = url
+        self.__on_stale = on_stale
+        self.__min_heal_interval_seconds = float(min_heal_interval_seconds)
         self.__now_wall_ms = now_wall_ms or (lambda: time.time_ns() // 1_000_000)
         self.__now_mono_ms = now_mono_ms or (lambda: time.monotonic_ns() // 1_000_000)
 
@@ -70,11 +97,17 @@ class PostFlapTipCorrelationMonitor:
         self.__reconnect_mono_ms: Optional[int] = None
         self.__generation = 0
         self.__watchdog_task: Optional[asyncio.Task] = None
+        self.__last_heal_mono: Optional[float] = None
 
     @property
     def stale_window_seconds(self) -> float:
         """Return the post-flap tip-stale observation window in seconds."""
         return self.__stale_window_seconds
+
+    @property
+    def min_heal_interval_seconds(self) -> float:
+        """Return the minimum interval between self-heal signals."""
+        return self.__min_heal_interval_seconds
 
     @property
     def url(self) -> str:
@@ -92,6 +125,17 @@ class PostFlapTipCorrelationMonitor:
             raise TypeError("tip_seq_provider must be callable")
         self.__tip_seq_provider = provider
 
+    def set_on_stale(self, callback: Optional[OnStaleCallback]) -> None:
+        """
+        Bind or clear the self-heal callback invoked on post-flap tip stagnation.
+
+        Preconditions:
+            - callback must be callable or None.
+        """
+        if callback is not None and not callable(callback):
+            raise TypeError("on_stale must be callable")
+        self.__on_stale = callback
+
     def set_stale_window_seconds(self, seconds: float) -> None:
         """
         Update the post-flap tip-stale observation window.
@@ -104,6 +148,19 @@ class PostFlapTipCorrelationMonitor:
         if not math.isfinite(float(seconds)) or float(seconds) <= 0:
             raise ValueError("stale_window_seconds must be > 0")
         self.__stale_window_seconds = float(seconds)
+
+    def set_min_heal_interval_seconds(self, seconds: float) -> None:
+        """
+        Update the minimum interval between self-heal signals.
+
+        Preconditions:
+            - seconds must be a finite number >= 0.
+        """
+        if not isinstance(seconds, (int, float)):
+            raise TypeError("min_heal_interval_seconds must be a number")
+        if float(seconds) < 0:
+            raise ValueError("min_heal_interval_seconds must be >= 0")
+        self.__min_heal_interval_seconds = float(seconds)
 
     def set_url(self, url: str) -> None:
         """Update the URL label used in structured flap logs."""
@@ -251,19 +308,41 @@ class PostFlapTipCorrelationMonitor:
             return
 
         elapsed_ms = int(self.__stale_window_seconds * 1000)
-        if (
-            reconnect_wall_ms is not None
-            and self.__now_wall_ms is not None
-        ):
+        if reconnect_wall_ms is not None and self.__now_wall_ms is not None:
             try:
                 elapsed_ms = max(0, int(self.__now_wall_ms()) - int(reconnect_wall_ms))
             except Exception:
                 elapsed_ms = int(self.__stale_window_seconds * 1000)
+        elapsed_seconds = float(elapsed_ms) / 1000.0
 
-        logger.warning(
+        now_mono = time.monotonic()
+        if (
+            self.__last_heal_mono is not None
+            and (now_mono - self.__last_heal_mono) < self.__min_heal_interval_seconds
+        ):
+            logger.warning(
+                "post_flap_tip_stale tip_seq=%s tip_seq_before=%s tip_seq_now=%s "
+                "window_s=%.1f elapsed_since_reconnect_ms=%s close_ts_ms=%s "
+                "reconnect_ts_ms=%s url=%s — self-heal suppressed "
+                "(cooldown min_heal_interval=%.1fs) to avoid a storm",
+                tip_now,
+                tip_seq_before,
+                tip_now,
+                self.__stale_window_seconds,
+                elapsed_ms,
+                _format_tip_seq(close_wall_ms),
+                _format_tip_seq(reconnect_wall_ms),
+                self.__url or "n/a",
+                self.__min_heal_interval_seconds,
+            )
+            return
+
+        self.__last_heal_mono = now_mono
+        logger.critical(
             "post_flap_tip_stale tip_seq=%s tip_seq_before=%s tip_seq_now=%s "
             "window_s=%.1f elapsed_since_reconnect_ms=%s close_ts_ms=%s "
-            "reconnect_ts_ms=%s url=%s — flap did not restore journal tip progress",
+            "reconnect_ts_ms=%s url=%s — flap did not restore journal tip progress "
+            "(BB-B5-A1) — signal self-heal collector (exit_code=%s)",
             tip_now,
             tip_seq_before,
             tip_now,
@@ -272,4 +351,7 @@ class PostFlapTipCorrelationMonitor:
             _format_tip_seq(close_wall_ms),
             _format_tip_seq(reconnect_wall_ms),
             self.__url or "n/a",
+            COLLECTOR_POST_FLAP_TIP_STALE_EXIT_CODE,
         )
+        if self.__on_stale is not None:
+            self.__on_stale(tip_seq_before, tip_now, elapsed_seconds)

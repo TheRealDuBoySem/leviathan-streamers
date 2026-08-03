@@ -12,6 +12,7 @@ from websockets.exceptions import ConnectionClosed
 
 from core.interfaces.base import IRetryPolicy, IWatchdog, IHeartbeat
 from core.network.post_flap_tip_correlation import (
+    OnStaleCallback,
     PostFlapTipCorrelationMonitor,
     TipSeqProvider,
 )
@@ -247,16 +248,28 @@ class ReconnectingWebSocketManager:
 
     def set_tip_seq_provider(self, provider: Optional[TipSeqProvider]) -> None:
         """
-        Bind an optional tip-seq sampler for post-flap correlation telemetry.
+        Bind an optional tip-seq sampler for post-flap tip correlation + heal.
 
         When set, public WS flaps log tip_seq before/after reconnect and may emit
-        ``post_flap_tip_stale`` if the tip does not advance in the observation window.
+        ``post_flap_tip_stale`` (CRITICAL) + ``on_stale`` if the tip does not
+        advance in the observation window (BB-B5-A1 flap-without-heal).
         """
         self.__flap_tip_monitor.set_tip_seq_provider(provider)
 
+    def set_on_post_flap_tip_stale(
+        self, callback: Optional[OnStaleCallback]
+    ) -> None:
+        """
+        Bind the self-heal callback for post-flap tip stagnation (BB-B5-A1).
+
+        Preconditions:
+            - callback must be callable or None.
+        """
+        self.__flap_tip_monitor.set_on_stale(callback)
+
     @property
     def flap_tip_monitor(self) -> PostFlapTipCorrelationMonitor:
-        """Return the post-flap tip correlation monitor (WATCH Day19 #2)."""
+        """Return the post-flap tip correlation / heal monitor (BB-B5-A1)."""
         return self.__flap_tip_monitor
 
     def is_stopped(self) -> bool:

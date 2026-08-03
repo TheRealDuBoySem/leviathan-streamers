@@ -189,3 +189,93 @@ async def test_stale_generation_mismatch_is_noop():
     if task is not None:
         await asyncio.sleep(0.12)
     assert stale_calls == []
+
+
+@pytest.mark.asyncio
+async def test_first_boot_mute_tip_arms_and_heals(caplog):
+    """Day20 WATCH #3 / H06: first confirm post-OS with 0 journal writes → heal.
+
+    Must not skip connect_generation=1 (false-negative that left tip 1684815 mute).
+    """
+    stale_calls: list[tuple[set[str], float]] = []
+    guard = PostReconnectWriteLivenessGuard(
+        timeout_seconds=0.05,
+        min_heal_interval_seconds=0.0,
+        on_stale=lambda symbols, elapsed: stale_calls.append((set(symbols), elapsed)),
+    )
+    assert guard.arm_count == 0
+
+    with caplog.at_level(logging.INFO):
+        guard.arm_after_subscriptions_confirmed(
+            {"XRPUSDT"},
+            connect_generation=1,
+        )
+
+    assert guard.arm_count == 1
+    assert guard.is_awaiting_write() is True
+    assert any(
+        "first_boot=True" in record.message or "connect_generation=1" in record.message
+        for record in caplog.records
+    )
+
+    with caplog.at_level(logging.CRITICAL):
+        await asyncio.sleep(0.12)
+
+    assert len(stale_calls) == 1
+    assert stale_calls[0][0] == {"XRPUSDT"}
+    assert any(
+        "first_boot=True" in record.message or "connect_generation=1" in record.message
+        for record in caplog.records
+        if record.levelno >= logging.CRITICAL
+    )
+    assert any("BB-B5-A1" in record.message for record in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_arm_never_skips_first_confirm():
+    """False-negative guard: first full confirm must always open a write window."""
+    stale_calls: list[object] = []
+    guard = PostReconnectWriteLivenessGuard(
+        timeout_seconds=0.05,
+        min_heal_interval_seconds=0.0,
+        on_stale=lambda *_: stale_calls.append(True),
+    )
+    # Explicit first-boot arm — must not be a no-op.
+    guard.arm_after_subscriptions_confirmed({"XRPUSDT"}, connect_generation=1)
+    assert guard.is_awaiting_write() is True
+    assert guard.arm_count == 1
+
+    await asyncio.sleep(0.12)
+    assert len(stale_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_first_boot_then_reconnect_both_arm_independently():
+    """OS first boot and a later flap reconnect each get their own write deadline."""
+    stale_calls: list[set[str]] = []
+    guard = PostReconnectWriteLivenessGuard(
+        timeout_seconds=0.05,
+        min_heal_interval_seconds=0.0,
+        on_stale=lambda symbols, _elapsed: stale_calls.append(set(symbols)),
+    )
+    guard.arm_after_subscriptions_confirmed({"XRPUSDT"}, connect_generation=1)
+    guard.record_journal_write()
+    assert guard.arm_count == 1
+
+    guard.arm_after_subscriptions_confirmed({"XRPUSDT"}, connect_generation=2)
+    assert guard.arm_count == 2
+    assert guard.is_awaiting_write() is True
+
+    await asyncio.sleep(0.12)
+    assert stale_calls == [{"XRPUSDT"}]
+
+
+def test_arm_rejects_non_positive_connect_generation():
+    guard = PostReconnectWriteLivenessGuard(timeout_seconds=1.0)
+    with pytest.raises(ValueError, match="connect_generation"):
+        guard.arm_after_subscriptions_confirmed({"XRPUSDT"}, connect_generation=0)
+    with pytest.raises(TypeError, match="connect_generation"):
+        guard.arm_after_subscriptions_confirmed(
+            {"XRPUSDT"},
+            connect_generation="1",  # type: ignore[arg-type]
+        )
