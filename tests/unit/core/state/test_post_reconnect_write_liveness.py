@@ -279,3 +279,52 @@ def test_arm_rejects_non_positive_connect_generation():
             {"XRPUSDT"},
             connect_generation="1",  # type: ignore[arg-type]
         )
+
+
+@pytest.mark.asyncio
+async def test_j22_style_post_flap_confirm_without_write_exposes_detection():
+    """After brief flap re-confirm, no journal write in grace → clear public detection.
+
+    Complements post-flap tip correlation for BB-B5-A1 (WS UP / 0 write).
+    """
+    stale_calls: list[tuple[set[str], float]] = []
+    guard = PostReconnectWriteLivenessGuard(
+        timeout_seconds=0.05,
+        min_heal_interval_seconds=0.0,
+        on_stale=lambda symbols, elapsed: stale_calls.append((set(symbols), elapsed)),
+    )
+    # Post-flap path: connect_generation >= 2 (reconnect after brief public flap).
+    guard.arm_after_subscriptions_confirmed({"XRPUSDT"}, connect_generation=2)
+    assert guard.is_awaiting_write() is True
+    assert guard.consume_last_stale_detection() is None
+
+    await asyncio.sleep(0.12)
+
+    assert guard.is_awaiting_write() is False
+    assert len(stale_calls) == 1
+    detection = guard.consume_last_stale_detection()
+    assert detection is not None
+    symbols, elapsed = detection
+    assert symbols == {"XRPUSDT"}
+    assert elapsed >= 0.04
+    assert elapsed == stale_calls[0][1]
+    # Consumed once — second call clears.
+    assert guard.consume_last_stale_detection() is None
+
+
+@pytest.mark.asyncio
+async def test_j22_style_post_flap_confirm_with_write_clears_without_detection():
+    """Tip/journal write in grace after flap re-confirm → no stale detection."""
+    stale_calls: list[object] = []
+    guard = PostReconnectWriteLivenessGuard(
+        timeout_seconds=0.08,
+        min_heal_interval_seconds=0.0,
+        on_stale=lambda *_: stale_calls.append(True),
+    )
+    guard.arm_after_subscriptions_confirmed({"XRPUSDT"}, connect_generation=2)
+    guard.record_journal_write()
+    assert guard.is_awaiting_write() is False
+
+    await asyncio.sleep(0.12)
+    assert stale_calls == []
+    assert guard.consume_last_stale_detection() is None

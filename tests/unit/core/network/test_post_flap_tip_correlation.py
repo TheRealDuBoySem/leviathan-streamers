@@ -8,6 +8,7 @@ import time
 import pytest
 
 from core.network.post_flap_tip_correlation import (
+    BRIEF_PUBLIC_FLAP_MS_THRESHOLD,
     COLLECTOR_POST_FLAP_TIP_STALE_EXIT_CODE,
     DEFAULT_MIN_HEAL_INTERVAL_SECONDS,
     DEFAULT_POST_FLAP_TIP_STALE_SECONDS,
@@ -23,6 +24,7 @@ from core.state.post_reconnect_write_liveness import COLLECTOR_WRITE_LIVENESS_EX
 def test_defaults_are_reasonable_and_exit_code_nonzero():
     assert DEFAULT_POST_FLAP_TIP_STALE_SECONDS == 30.0
     assert DEFAULT_MIN_HEAL_INTERVAL_SECONDS == 120.0
+    assert BRIEF_PUBLIC_FLAP_MS_THRESHOLD == 5_000
     assert COLLECTOR_POST_FLAP_TIP_STALE_EXIT_CODE == 1
     assert COLLECTOR_POST_FLAP_TIP_STALE_EXIT_CODE == COLLECTOR_WRITE_LIVENESS_EXIT_CODE
 
@@ -187,6 +189,118 @@ async def test_j21_h20_tip_1684815_stagnant_after_1250ms_flap_heals(caplog):
         and "BB-B5-A1" in r.message
         and f"exit_code={COLLECTOR_POST_FLAP_TIP_STALE_EXIT_CODE}" in r.message
         for r in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_j22_h20_brief_1240ms_flap_stagnant_tip_detects_and_heals(caplog):
+    """J22 H20 @20:28: brief ~1.24s public flap + tip stagnant → public detection + heal.
+
+    Tip did not re-freeze on that live day; this locks the historical WS-UP/0-write path.
+    """
+    tip = {"seq": 1_718_560}
+    stale_calls: list[tuple[int, int, float]] = []
+    monitor = PostFlapTipCorrelationMonitor(
+        tip_seq_provider=lambda: tip["seq"],
+        stale_window_seconds=0.05,
+        url="wss://ws.bitget.com/v2/ws/public",
+        on_stale=lambda before, now, elapsed: stale_calls.append((before, now, elapsed)),
+        min_heal_interval_seconds=0.0,
+    )
+
+    with caplog.at_level(logging.INFO):
+        monitor.note_connection_closed(close_wall_ms=20_28_43_016, close_mono_ms=100)
+        assert monitor.is_awaiting_tip_progress() is False
+        monitor.note_connection_restored(
+            reconnect_wall_ms=20_28_44_259,
+            reconnect_mono_ms=1_340,  # +1240 ms (J22 H20)
+        )
+
+    assert monitor.last_flap_duration_ms == 1240
+    assert monitor.is_awaiting_tip_progress() is True
+    correlation = next(r.message for r in caplog.records if "post_flap_correlation" in r.message)
+    assert "since_close_ms=1240" in correlation
+    assert "brief_public_flap=True" in correlation
+
+    with caplog.at_level(logging.CRITICAL):
+        await asyncio.sleep(0.12)
+
+    assert monitor.is_awaiting_tip_progress() is False
+    assert len(stale_calls) == 1
+    assert stale_calls[0][:2] == (1_718_560, 1_718_560)
+    detection = monitor.consume_last_tip_stale_detection()
+    assert detection is not None
+    assert detection == (1_718_560, 1_718_560, stale_calls[0][2])
+    assert monitor.consume_last_tip_stale_detection() is None
+    assert any(
+        "post_flap_tip_stale" in r.message
+        and "BB-B5-A1" in r.message
+        and r.levelno >= logging.CRITICAL
+        for r in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_j22_h21_brief_1300ms_flap_tip_advances_no_stale(caplog):
+    """J22 H21 ~1.3s public flap where tip advances in grace → no heal."""
+    tip = {"seq": 1_719_171}
+    stale_calls: list[object] = []
+    monitor = PostFlapTipCorrelationMonitor(
+        tip_seq_provider=lambda: tip["seq"],
+        stale_window_seconds=0.08,
+        url="wss://ws.bitget.com/v2/ws/public",
+        on_stale=lambda *_: stale_calls.append(True),
+        min_heal_interval_seconds=0.0,
+    )
+    monitor.note_connection_closed(close_wall_ms=21_06_27_000, close_mono_ms=100)
+    monitor.note_connection_restored(
+        reconnect_wall_ms=21_06_28_300,
+        reconnect_mono_ms=1_400,  # +1300 ms (J22 H21)
+    )
+    assert monitor.last_flap_duration_ms == 1300
+    assert monitor.is_awaiting_tip_progress() is True
+
+    tip["seq"] = 1_719_200
+    assert monitor.record_tip_progress() is True
+    assert monitor.is_awaiting_tip_progress() is False
+
+    with caplog.at_level(logging.WARNING):
+        await asyncio.sleep(0.15)
+
+    assert stale_calls == []
+    assert monitor.consume_last_tip_stale_detection() is None
+    assert not any("post_flap_tip_stale" in r.message for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_arm_uses_tip_after_as_baseline_when_tip_before_missing(caplog):
+    """WS-UP / 0-write: still arm when tip only becomes readable after restore."""
+    tip = {"seq": None}
+
+    def _provider():
+        return tip["seq"]
+
+    stale_calls: list[tuple[int, int, float]] = []
+    monitor = PostFlapTipCorrelationMonitor(
+        tip_seq_provider=_provider,
+        stale_window_seconds=0.05,
+        on_stale=lambda before, now, elapsed: stale_calls.append((before, now, elapsed)),
+        min_heal_interval_seconds=0.0,
+    )
+    monitor.note_connection_closed(close_wall_ms=1, close_mono_ms=1)
+    tip["seq"] = 50
+    monitor.note_connection_restored(reconnect_wall_ms=2, reconnect_mono_ms=2)
+    assert monitor.is_awaiting_tip_progress() is True
+
+    with caplog.at_level(logging.CRITICAL):
+        await asyncio.sleep(0.12)
+
+    assert len(stale_calls) == 1
+    assert stale_calls[0][:2] == (50, 50)
+    assert monitor.consume_last_tip_stale_detection() == (
+        50,
+        50,
+        stale_calls[0][2],
     )
 
 
@@ -487,3 +601,26 @@ async def test_stale_check_aborts_on_generation_mismatch(caplog):
     with caplog.at_level(logging.WARNING):
         await asyncio.sleep(0.12)
     assert not any("post_flap_tip_stale" in r.message for r in caplog.records)
+
+
+def test_record_tip_progress_false_when_not_awaiting():
+    monitor = PostFlapTipCorrelationMonitor(tip_seq_provider=lambda: 10)
+    assert monitor.record_tip_progress() is False
+
+
+@pytest.mark.asyncio
+async def test_record_tip_progress_false_when_tip_missing_or_not_advanced():
+    tip = {"seq": 100}
+    monitor = PostFlapTipCorrelationMonitor(
+        tip_seq_provider=lambda: tip["seq"],
+        stale_window_seconds=1.0,
+    )
+    monitor.note_connection_closed(close_wall_ms=1, close_mono_ms=1)
+    monitor.note_connection_restored(reconnect_wall_ms=2, reconnect_mono_ms=2)
+    assert monitor.is_awaiting_tip_progress() is True
+    assert monitor.record_tip_progress() is False  # tip_now == baseline
+
+    tip["seq"] = None
+    assert monitor.record_tip_progress() is False  # tip_now is None
+
+    monitor.cancel()

@@ -6,6 +6,15 @@ module correlates public WS flaps with journal tip progress and, when the tip
 does not advance in the observation window, emits ``post_flap_tip_stale`` at
 CRITICAL and invokes ``on_stale`` so the collector can fail-fast (non-zero exit).
 
+Covers brief public flaps (J22 H20 ~1.24s / H21 ~1.3s): WS reconnects quickly
+but tip may stay mute (historical WS-UP / 0-write). Public detection APIs
+expose awaiting state and consumable stale results for heal correlation.
+
+Wiring note (gap, intentional under BB-B5-A1 scope): ``record_tip_progress`` is
+a public early-satisfy hook; collectors may call it from the journal write path.
+``ReconnectingWebSocketManager`` already wires close/restore + tip provider;
+optional early-satisfy call-site is not required for deadline-based detection.
+
 Pattern: Observer — samples tip_seq around flap close/reconnect; Command-like
 heal callback on confirmed tip stagnation.
 """
@@ -15,7 +24,7 @@ import asyncio
 import logging
 import math
 import time
-from typing import Callable, Optional
+from typing import Callable, Optional, Tuple
 
 from core.state.post_reconnect_write_liveness import (
     COLLECTOR_WRITE_LIVENESS_EXIT_CODE,
@@ -25,12 +34,15 @@ from core.state.post_reconnect_write_liveness import (
 logger = logging.getLogger(__name__)
 
 DEFAULT_POST_FLAP_TIP_STALE_SECONDS = 30.0
+# J22 H20/H21 brief flaps were ~1.2–1.3s; tag anything under this as brief_public_flap.
+BRIEF_PUBLIC_FLAP_MS_THRESHOLD = 5_000
 # Same non-zero exit as write-liveness so the supervised collector path is uniform.
 COLLECTOR_POST_FLAP_TIP_STALE_EXIT_CODE = COLLECTOR_WRITE_LIVENESS_EXIT_CODE
 
 TipSeqProvider = Callable[[], Optional[int]]
 # tip_seq_before, tip_seq_now, elapsed_seconds_since_reconnect
 OnStaleCallback = Callable[[int, int, float], None]
+TipStaleDetection = Tuple[int, int, float]
 
 
 def _format_tip_seq(value: Optional[int]) -> str:
@@ -49,8 +61,10 @@ class PostFlapTipCorrelationMonitor:
         - At most one post-flap tip-stale watchdog task is scheduled at a time.
         - ``note_connection_restored`` is a no-op unless a prior close was noted
           (first connect is not a flap).
-        - Without a tip_seq provider, correlation still logs timestamps but never
-          emits ``post_flap_tip_stale`` / ``on_stale``.
+        - Without a readable tip baseline (before or after restore), correlation
+          still logs timestamps but never emits ``post_flap_tip_stale`` / ``on_stale``.
+        - When tip_before is missing but tip_after is readable, the after value is
+          used as the stagnation baseline (WS-UP / 0-write after reconnect).
         - ``on_stale`` fires at most once per armed generation and respects the
           min heal interval across generations.
     """
@@ -91,13 +105,16 @@ class PostFlapTipCorrelationMonitor:
 
         self.__pending_close = False
         self.__tip_seq_before: Optional[int] = None
+        self.__tip_seq_baseline: Optional[int] = None
         self.__close_wall_ms: Optional[int] = None
         self.__close_mono_ms: Optional[int] = None
         self.__reconnect_wall_ms: Optional[int] = None
         self.__reconnect_mono_ms: Optional[int] = None
+        self.__last_flap_duration_ms: Optional[int] = None
         self.__generation = 0
         self.__watchdog_task: Optional[asyncio.Task] = None
         self.__last_heal_mono: Optional[float] = None
+        self.__last_tip_stale_detection: Optional[TipStaleDetection] = None
 
     @property
     def stale_window_seconds(self) -> float:
@@ -113,6 +130,51 @@ class PostFlapTipCorrelationMonitor:
     def url(self) -> str:
         """Return the WebSocket URL label included in structured logs."""
         return self.__url
+
+    @property
+    def last_flap_duration_ms(self) -> Optional[int]:
+        """Return mono duration of the last completed flap, or None if none yet."""
+        return self.__last_flap_duration_ms
+
+    def is_awaiting_tip_progress(self) -> bool:
+        """True while an armed post-flap window is waiting for tip_seq to advance."""
+        return self.__watchdog_task is not None and not self.__watchdog_task.done()
+
+    def consume_last_tip_stale_detection(self) -> Optional[TipStaleDetection]:
+        """
+        Return and clear the last tip-stale detection, if any.
+
+        Returns:
+            ``(tip_seq_before, tip_seq_now, elapsed_seconds)`` when a stale
+            window completed without tip progress; otherwise ``None``.
+        """
+        detection = self.__last_tip_stale_detection
+        self.__last_tip_stale_detection = None
+        return detection
+
+    def record_tip_progress(self) -> bool:
+        """
+        Satisfy the armed window early when journal tip_seq has advanced.
+
+        Returns:
+            True if an awaiting window was satisfied and cancelled; False if
+            no window was active or tip has not advanced past the baseline.
+        """
+        if not self.is_awaiting_tip_progress():
+            return False
+        baseline = self.__tip_seq_baseline
+        if baseline is None:  # pragma: no cover — cleared only with cancel (task gone)
+            return False
+        tip_now = self.__sample_tip_seq()
+        if tip_now is None or tip_now <= baseline:
+            return False
+        logger.debug(
+            "post_flap_correlation tip advanced early tip_seq_before=%s tip_seq_now=%s",
+            baseline,
+            tip_now,
+        )
+        self.cancel()
+        return True
 
     def set_tip_seq_provider(self, provider: Optional[TipSeqProvider]) -> None:
         """
@@ -188,8 +250,10 @@ class PostFlapTipCorrelationMonitor:
             int(close_mono_ms) if close_mono_ms is not None else self.__now_mono_ms()
         )
         self.__tip_seq_before = self.__sample_tip_seq()
+        self.__tip_seq_baseline = None
         self.__reconnect_wall_ms = None
         self.__reconnect_mono_ms = None
+        self.__last_flap_duration_ms = None
 
     def note_connection_restored(
         self,
@@ -201,6 +265,8 @@ class PostFlapTipCorrelationMonitor:
         After a prior close, emit ``post_flap_correlation`` and arm tip-stale check.
 
         No-op on first connect (no prior ``note_connection_closed``).
+        Arms when tip_before is readable, or when tip_after alone is readable
+        (baseline = tip_after) so brief flaps still catch WS-UP / 0-write mute.
         """
         if not self.__pending_close:
             return
@@ -223,32 +289,40 @@ class PostFlapTipCorrelationMonitor:
             if self.__close_mono_ms is not None
             else None
         )
+        self.__last_flap_duration_ms = since_close_ms
+        brief_public_flap = (
+            since_close_ms is not None and 0 <= since_close_ms < BRIEF_PUBLIC_FLAP_MS_THRESHOLD
+        )
 
         logger.info(
             "post_flap_correlation event=ws_flap_reconnect url=%s "
             "close_ts_ms=%s reconnect_ts_ms=%s close_mono_ms=%s reconnect_mono_ms=%s "
-            "since_close_ms=%s tip_seq_before=%s tip_seq_after=%s",
+            "since_close_ms=%s brief_public_flap=%s tip_seq_before=%s tip_seq_after=%s",
             self.__url or "n/a",
             _format_tip_seq(self.__close_wall_ms),
             _format_tip_seq(self.__reconnect_wall_ms),
             _format_tip_seq(self.__close_mono_ms),
             _format_tip_seq(self.__reconnect_mono_ms),
             _format_tip_seq(since_close_ms),
+            brief_public_flap,
             _format_tip_seq(tip_before),
             _format_tip_seq(tip_after),
         )
 
-        if tip_before is None:
+        baseline = tip_before if tip_before is not None else tip_after
+        if baseline is None:
             return
 
+        self.__tip_seq_baseline = baseline
         self.__generation += 1
         generation = self.__generation
         self.__watchdog_task = asyncio.create_task(
             self.__evaluate_tip_stale_after_window(
                 generation=generation,
-                tip_seq_before=tip_before,
+                tip_seq_before=baseline,
                 close_wall_ms=self.__close_wall_ms,
                 reconnect_wall_ms=self.__reconnect_wall_ms,
+                brief_public_flap=brief_public_flap,
             ),
             name="post-flap-tip-stale",
         )
@@ -258,6 +332,7 @@ class PostFlapTipCorrelationMonitor:
         self.__generation += 1
         task = self.__watchdog_task
         self.__watchdog_task = None
+        self.__tip_seq_baseline = None
         if task is not None and not task.done():
             task.cancel()
 
@@ -286,6 +361,7 @@ class PostFlapTipCorrelationMonitor:
         tip_seq_before: int,
         close_wall_ms: Optional[int],
         reconnect_wall_ms: Optional[int],
+        brief_public_flap: bool = False,
     ) -> None:
         try:
             await asyncio.sleep(self.__stale_window_seconds)
@@ -296,6 +372,7 @@ class PostFlapTipCorrelationMonitor:
             return
 
         self.__watchdog_task = None
+        self.__tip_seq_baseline = None
         tip_now = self.__sample_tip_seq()
         if tip_now is None:
             return
@@ -323,7 +400,7 @@ class PostFlapTipCorrelationMonitor:
             logger.warning(
                 "post_flap_tip_stale tip_seq=%s tip_seq_before=%s tip_seq_now=%s "
                 "window_s=%.1f elapsed_since_reconnect_ms=%s close_ts_ms=%s "
-                "reconnect_ts_ms=%s url=%s — self-heal suppressed "
+                "reconnect_ts_ms=%s brief_public_flap=%s url=%s — self-heal suppressed "
                 "(cooldown min_heal_interval=%.1fs) to avoid a storm",
                 tip_now,
                 tip_seq_before,
@@ -332,17 +409,20 @@ class PostFlapTipCorrelationMonitor:
                 elapsed_ms,
                 _format_tip_seq(close_wall_ms),
                 _format_tip_seq(reconnect_wall_ms),
+                brief_public_flap,
                 self.__url or "n/a",
                 self.__min_heal_interval_seconds,
             )
             return
 
         self.__last_heal_mono = now_mono
+        self.__last_tip_stale_detection = (tip_seq_before, tip_now, elapsed_seconds)
         logger.critical(
             "post_flap_tip_stale tip_seq=%s tip_seq_before=%s tip_seq_now=%s "
             "window_s=%.1f elapsed_since_reconnect_ms=%s close_ts_ms=%s "
-            "reconnect_ts_ms=%s url=%s — flap did not restore journal tip progress "
-            "(BB-B5-A1) — signal self-heal collector (exit_code=%s)",
+            "reconnect_ts_ms=%s brief_public_flap=%s url=%s — flap did not restore "
+            "journal tip progress (BB-B5-A1 / WS-UP 0-write) — signal self-heal "
+            "collector (exit_code=%s)",
             tip_now,
             tip_seq_before,
             tip_now,
@@ -350,6 +430,7 @@ class PostFlapTipCorrelationMonitor:
             elapsed_ms,
             _format_tip_seq(close_wall_ms),
             _format_tip_seq(reconnect_wall_ms),
+            brief_public_flap,
             self.__url or "n/a",
             COLLECTOR_POST_FLAP_TIP_STALE_EXIT_CODE,
         )

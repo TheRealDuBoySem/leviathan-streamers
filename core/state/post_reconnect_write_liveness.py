@@ -6,6 +6,10 @@ configurable window. Otherwise emit a clear CRITICAL and invoke a self-heal
 callback (collector non-zero exit / stop) — once per window, with a min heal
 interval to avoid aggressive storms.
 
+Also covers post-flap reconnect confirms (J22 H20/H21 brief ~1.2–1.3s flaps):
+WS can be UP again with 0 journal writes — ``consume_last_stale_detection``
+exposes that outcome for heal correlation.
+
 False-negative policy: every full confirm arms a window. Never skip
 ``connect_generation=1`` (first boot / post-OS collector respawn).
 
@@ -17,7 +21,7 @@ import asyncio
 import logging
 import math
 import time
-from typing import Callable, Optional, Set
+from typing import Callable, Optional, Set, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +33,7 @@ DEFAULT_MIN_HEAL_INTERVAL_SECONDS = 120.0
 COLLECTOR_WRITE_LIVENESS_EXIT_CODE = 1
 
 OnStaleCallback = Callable[[Set[str], float], None]
+StaleDetection = Tuple[Set[str], float]
 
 
 class PostReconnectWriteLivenessGuard:
@@ -71,6 +76,7 @@ class PostReconnectWriteLivenessGuard:
         self.__arm_count = 0
         self.__armed_connect_generation: Optional[int] = None
         self.__armed_first_boot = False
+        self.__last_stale_detection: Optional[StaleDetection] = None
 
     @property
     def timeout_seconds(self) -> float:
@@ -90,6 +96,19 @@ class PostReconnectWriteLivenessGuard:
     def is_awaiting_write(self) -> bool:
         """True while an armed window is waiting for a journal write."""
         return self.__watchdog_task is not None and not self.__watchdog_task.done()
+
+    def consume_last_stale_detection(self) -> Optional[StaleDetection]:
+        """
+        Return and clear the last write-liveness stale detection, if any.
+
+        Returns:
+            ``(confirmed_symbols, elapsed_seconds)`` when a window expired
+            without a journal write (and heal was not cooldown-suppressed);
+            otherwise ``None``.
+        """
+        detection = self.__last_stale_detection
+        self.__last_stale_detection = None
+        return detection
 
     def arm_after_subscriptions_confirmed(
         self,
@@ -227,12 +246,13 @@ class PostReconnectWriteLivenessGuard:
             return
 
         self.__last_heal_mono = now
+        self.__last_stale_detection = (confirmed, elapsed)
         logger.critical(
             "Post-confirm write-liveness FAILED (BB-B5-A1 / Day20 WATCH#3): "
             "aucune écriture journal dans %.1fs après abonnements confirmés=%s "
             "arm_count=%s connect_generation=%s first_boot=%s — tip mute "
-            "(OS-restart / post-confirm path) — signal self-heal collector "
-            "(exit_code=%s)",
+            "(OS-restart / post-flap / post-confirm path, WS-UP 0-write) — "
+            "signal self-heal collector (exit_code=%s)",
             elapsed,
             sorted(confirmed),
             arm_count,
