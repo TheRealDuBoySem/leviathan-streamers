@@ -1,6 +1,6 @@
 import asyncio
 import pytest
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 from exchanges.bitget.bitget_tick_stream import BitgetTickStream
 from core.network.reconnecting_ws_manager import ReconnectingWebSocketManager
 from core.network.retry_policy import RetryPolicy
@@ -815,6 +815,138 @@ async def test_start_streaming_logs_full_confirmation_after_reconnect(
         and "XRPUSDT" in record.message
         for record in caplog.records
     )
+
+
+@pytest.mark.asyncio
+async def test_full_confirmation_arms_write_liveness_then_stale_without_writes(
+    mocker, mock_ws_manager, mock_parser, caplog
+):
+    """BB-B5-A1: sub OK after reconnect but no journal write → write-liveness stale."""
+    import logging
+
+    from core.state.post_reconnect_write_liveness import PostReconnectWriteLivenessGuard
+
+    stale_calls: list[set[str]] = []
+    guard = PostReconnectWriteLivenessGuard(
+        timeout_seconds=0.05,
+        min_heal_interval_seconds=0.0,
+        on_stale=lambda symbols, _elapsed: stale_calls.append(set(symbols)),
+    )
+
+    captured, original = _capture_on_connect_callback(mock_ws_manager)
+    stream = BitgetTickStream(
+        network_manager=mock_ws_manager,
+        subscription_strategy=BitgetSubscriptionProtocol(inst_type="mc"),
+        parsing_strategy=mock_parser,
+        dispatch_strategy=AsyncQueueDispatcher(),
+        symbols=["XRPUSDT"],
+        confirmation_timeout_seconds=1.0,
+        write_liveness_guard=guard,
+    )
+    mock_ws_manager.set_on_connect_callback = original
+    mocker.patch(
+        "core.network.reconnecting_ws_manager.ReconnectingWebSocketManager.send",
+        new_callable=AsyncMock,
+    )
+    await captured[0]()
+
+    async def mock_listen():
+        yield orjson_subscribe_ack("XRPUSDT")
+        await asyncio.sleep(0.15)
+
+    mocker.patch.object(
+        stream.network_manager,
+        "start_connection_and_listen",
+        side_effect=mock_listen,
+    )
+
+    with caplog.at_level(logging.CRITICAL):
+        await stream.start_streaming()
+
+    assert stale_calls == [{"XRPUSDT"}]
+    assert any("BB-B5-A1" in record.message for record in caplog.records)
+    assert stream.write_liveness_guard is guard
+
+
+def test_bitget_tick_stream_rejects_invalid_write_liveness_guard(
+    mock_ws_manager, mock_parser
+):
+    with pytest.raises(TypeError, match="write_liveness_guard must be a PostReconnectWriteLivenessGuard"):
+        BitgetTickStream(
+            network_manager=mock_ws_manager,
+            subscription_strategy=BitgetSubscriptionProtocol(inst_type="mc"),
+            parsing_strategy=mock_parser,
+            dispatch_strategy=AsyncQueueDispatcher(),
+            symbols=["XRPUSDT"],
+            write_liveness_guard=object(),  # type: ignore[arg-type]
+        )
+
+
+def test_tip_seq_provider_skips_non_callable_latest_seq(
+    mocker, mock_ws_manager, mock_parser, tmp_path
+):
+    from core.journal.journal_dispatch_decorator import JournalDispatchDecorator
+    from core.journal.tick_journal import TickJournal
+    from core.routing.sink_dispatch_strategy import SinkDispatchStrategy
+
+    journal = TickJournal(str(tmp_path))
+    journal.latest_seq = 42  # shadow method with non-callable attribute
+    dispatch = JournalDispatchDecorator(SinkDispatchStrategy(), journal)
+
+    mgr = mock_ws_manager
+    set_provider = mocker.MagicMock()
+    mgr.set_tip_seq_provider = set_provider
+    BitgetTickStream(
+        network_manager=mgr,
+        subscription_strategy=BitgetSubscriptionProtocol(inst_type="mc"),
+        parsing_strategy=mock_parser,
+        dispatch_strategy=dispatch,
+        symbols=["XRPUSDT"],
+    )
+    set_provider.assert_not_called()
+
+
+def test_tip_seq_provider_returns_none_when_journal_latest_is_none(
+    mocker, mock_ws_manager, mock_parser, tmp_path
+):
+    from core.journal.journal_dispatch_decorator import JournalDispatchDecorator
+    from core.journal.tick_journal import TickJournal
+    from core.routing.sink_dispatch_strategy import SinkDispatchStrategy
+
+    journal = TickJournal(str(tmp_path))
+    mocker.patch.object(journal, "latest_seq", return_value=None)
+    dispatch = JournalDispatchDecorator(SinkDispatchStrategy(), journal)
+    mgr = mock_ws_manager
+    set_provider = mocker.MagicMock()
+    mgr.set_tip_seq_provider = set_provider
+    BitgetTickStream(
+        network_manager=mgr,
+        subscription_strategy=BitgetSubscriptionProtocol(inst_type="mc"),
+        parsing_strategy=mock_parser,
+        dispatch_strategy=dispatch,
+        symbols=["XRPUSDT"],
+    )
+    set_provider.assert_called_once()
+    assert set_provider.call_args.args[0]() is None
+
+
+@pytest.mark.asyncio
+async def test_stop_cancels_write_liveness_guard(mocker, mock_ws_manager, mock_parser):
+    from core.state.post_reconnect_write_liveness import PostReconnectWriteLivenessGuard
+
+    guard = PostReconnectWriteLivenessGuard(timeout_seconds=5.0)
+    cancel = mocker.spy(guard, "cancel")
+    stream = BitgetTickStream(
+        network_manager=mock_ws_manager,
+        subscription_strategy=BitgetSubscriptionProtocol(inst_type="mc"),
+        parsing_strategy=mock_parser,
+        dispatch_strategy=AsyncQueueDispatcher(),
+        symbols=["XRPUSDT"],
+        write_liveness_guard=guard,
+    )
+    mocker.patch.object(mock_ws_manager, "stop", new_callable=AsyncMock)
+    await stream.stop()
+    cancel.assert_called()
 
 
 @pytest.mark.asyncio

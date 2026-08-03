@@ -6,6 +6,7 @@ from core.interfaces.base import ISubscriptionStrategy, IParsingStrategy, IDispa
 from core.state.subscription_confirmation_tracker import (
     DEFAULT_CONFIRMATION_TIMEOUT_SECONDS,
 )
+from core.state.post_reconnect_write_liveness import PostReconnectWriteLivenessGuard
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +26,7 @@ class BitgetTickStream(BaseExchangeStream):
         dispatch_strategy: IDispatchStrategy,
         symbols: Optional[List[str]] = None,
         confirmation_timeout_seconds: float = DEFAULT_CONFIRMATION_TIMEOUT_SECONDS,
+        write_liveness_guard: Optional[PostReconnectWriteLivenessGuard] = None,
     ):
         super().__init__(
             network_manager=network_manager,
@@ -33,5 +35,5 @@ class BitgetTickStream(BaseExchangeStream):
             dispatch_strategy=dispatch_strategy,
             symbols=symbols,
             confirmation_timeout_seconds=confirmation_timeout_seconds,
+            write_liveness_guard=write_liveness_guard,
         )
-

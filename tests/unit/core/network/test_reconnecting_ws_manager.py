@@ -520,6 +520,59 @@ def test_log_reconnect_countdown_without_close_mono(caplog):
 
 
 @pytest.mark.asyncio
+async def test_flap_emits_post_flap_correlation_and_tip_stale(caplog):
+    """WATCH Day19 #2: close→reconnect logs tip correlation; frozen tip → WARNING."""
+    import logging
+    from websockets.exceptions import ConnectionClosed
+
+    tip = {"seq": 1_684_815}
+    mgr = ReconnectingWebSocketManager(
+        "wss://example/ws/public",
+        RetryPolicy(max_retries=2, max_delay=0),
+        SilenceWatchdog(timeout_seconds=60.0),
+        KeepAliveEmitter(interval_seconds=60.0),
+    )
+    mgr.set_tip_seq_provider(lambda: tip["seq"])
+    mgr.flap_tip_monitor.set_stale_window_seconds(0.05)
+
+    phase = {"n": 0}
+    reconnected = asyncio.Event()
+
+    class FlapThenHoldWS(BaseMockWS):
+        async def __aiter__(self):
+            phase["n"] += 1
+            if phase["n"] == 1:
+                raise ConnectionClosed(None, None)
+                yield  # pragma: no cover
+            reconnected.set()
+            yield "msg-after-flap"
+            while not self.closed:
+                await asyncio.sleep(0.01)
+
+    with patch("websockets.connect", side_effect=lambda *a, **k: FlapThenHoldWS()):
+        with caplog.at_level(logging.INFO):
+            listen_task = asyncio.create_task(
+                _run_listen_until_stopped(mgr),
+                name="flap-listen",
+            )
+            await asyncio.wait_for(reconnected.wait(), timeout=2.0)
+            await asyncio.sleep(0.12)
+            await mgr.stop()
+            await listen_task
+
+    assert any("post_flap_correlation" in r.message for r in caplog.records)
+    assert any(
+        "post_flap_tip_stale" in r.message and r.levelno == logging.WARNING
+        for r in caplog.records
+    )
+    correlation = next(
+        r.message for r in caplog.records if "post_flap_correlation" in r.message
+    )
+    assert "tip_seq_before=1684815" in correlation
+    assert "tip_seq_after=1684815" in correlation
+
+
+@pytest.mark.asyncio
 async def test_reconnecting_ws_manager_connection_closed_code_and_await_cancel():
     from websockets.exceptions import ConnectionClosed
     mgr = ReconnectingWebSocketManager("ws://t", RetryPolicy(max_retries=1), SilenceWatchdog(), KeepAliveEmitter())

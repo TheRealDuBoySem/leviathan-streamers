@@ -120,3 +120,32 @@ def test_journal_dispatch_decorator_exposes_journal_property(tmp_path):
     decorator = JournalDispatchDecorator(AsyncQueueDispatcher(), journal)
     assert decorator.journal is journal
     assert decorator.inner is not None
+
+
+@pytest.mark.asyncio
+async def test_journal_dispatch_notifies_write_liveness_guard(tmp_path):
+    journal = TickJournal(str(tmp_path))
+    pings: list[int] = []
+
+    class _Guard:
+        def record_journal_write(self) -> None:
+            pings.append(1)
+
+    decorator = JournalDispatchDecorator(
+        _StubDispatchStrategy(),
+        journal,
+        write_liveness_guard=_Guard(),
+    )
+    await decorator.dispatch(_tick("live1"))
+    assert pings == [1]
+    assert decorator.write_liveness_guard is not None
+
+
+def test_journal_dispatch_rejects_invalid_write_liveness_guard(tmp_path):
+    journal = TickJournal(str(tmp_path))
+    with pytest.raises(TypeError, match="write_liveness_guard"):
+        JournalDispatchDecorator(
+            AsyncQueueDispatcher(),
+            journal,
+            write_liveness_guard=object(),  # type: ignore[arg-type]
+        )

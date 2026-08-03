@@ -3,6 +3,7 @@ from typing import Optional, List
 from core.interfaces.base import IDispatchStrategy
 from core.network.reconnecting_ws_manager import ReconnectingWebSocketManager
 from core.routing.async_queue_dispatcher import AsyncQueueDispatcher
+from core.state.post_reconnect_write_liveness import PostReconnectWriteLivenessGuard
 from exchanges.bitget.bitget_subscription_protocol import BitgetSubscriptionProtocol
 from exchanges.bitget.parsing.bitget_message_parser import BitgetMessageParser
 from exchanges.bitget.bitget_tick_stream import BitgetTickStream
@@ -45,6 +46,7 @@ class BitgetStreamFactory:
         keep_alive_payload: str = "ping",
         connect_timeout: float = 10.0,
         dispatch_strategy: Optional[IDispatchStrategy] = None,
+        write_liveness_guard: Optional[PostReconnectWriteLivenessGuard] = None,
     ) -> BitgetTickStream:
         """
         Create a fully configured BitgetTickStream.
@@ -58,6 +60,8 @@ class BitgetStreamFactory:
             - inst_type must be a non-empty string.
             - symbols, if provided, must be a list of non-empty strings.
             - dispatch_strategy, if provided, must implement IDispatchStrategy.
+            - write_liveness_guard, if provided, must be a
+              PostReconnectWriteLivenessGuard instance.
 
         Postconditions:
             - Returned stream uses default Bitget parsing and subscription strategies.
@@ -79,6 +83,12 @@ class BitgetStreamFactory:
 
         if dispatch_strategy is not None and not isinstance(dispatch_strategy, IDispatchStrategy):
             raise TypeError("dispatch_strategy must be a IDispatchStrategy instance")
+        if write_liveness_guard is not None and not isinstance(
+            write_liveness_guard, PostReconnectWriteLivenessGuard
+        ):
+            raise TypeError(
+                "write_liveness_guard must be a PostReconnectWriteLivenessGuard instance"
+            )
 
         network_manager = ReconnectingWebSocketManager.create_default(
             url=url,
@@ -99,4 +109,5 @@ class BitgetStreamFactory:
             parsing_strategy=parsing_strategy,
             dispatch_strategy=dispatch_strategy,
             symbols=symbols,
+            write_liveness_guard=write_liveness_guard,
         )

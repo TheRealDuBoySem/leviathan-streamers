@@ -78,6 +78,9 @@ def test_bitget_stream_factory_dispatch_strategy():
     with pytest.raises(TypeError, match="dispatch_strategy must be a IDispatchStrategy instance"):
         BitgetStreamFactory.create_stream(url="ws://test", dispatch_strategy=object())
 
+    with pytest.raises(TypeError, match="write_liveness_guard"):
+        BitgetStreamFactory.create_stream(url="ws://test", write_liveness_guard=object())  # type: ignore[arg-type]
+
 
 def test_bitget_stream_factory_timeout_propagation():
     """Verify that timeout/keep_alive/connect parameters propagate correctly."""

@@ -1,0 +1,327 @@
+"""TDD: post-flap tip-seq correlation telemetry (WATCH Day19 #2)."""
+from __future__ import annotations
+
+import asyncio
+import logging
+
+import pytest
+
+from core.network.post_flap_tip_correlation import (
+    DEFAULT_POST_FLAP_TIP_STALE_SECONDS,
+    PostFlapTipCorrelationMonitor,
+)
+from core.network.reconnecting_ws_manager import ReconnectingWebSocketManager
+from core.network.retry_policy import RetryPolicy
+from core.network.silence_watchdog import SilenceWatchdog
+from core.network.keep_alive_emitter import KeepAliveEmitter
+
+
+def test_defaults_are_reasonable():
+    assert DEFAULT_POST_FLAP_TIP_STALE_SECONDS == 30.0
+
+
+def test_monitor_rejects_invalid_stale_window():
+    with pytest.raises(TypeError, match="stale_window_seconds must be a number"):
+        PostFlapTipCorrelationMonitor(stale_window_seconds="slow")  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="stale_window_seconds must be > 0"):
+        PostFlapTipCorrelationMonitor(stale_window_seconds=0)
+
+
+def test_set_stale_window_seconds_validates():
+    monitor = PostFlapTipCorrelationMonitor()
+    with pytest.raises(ValueError, match="stale_window_seconds must be > 0"):
+        monitor.set_stale_window_seconds(0)
+    monitor.set_stale_window_seconds(0.05)
+    assert monitor.stale_window_seconds == 0.05
+
+
+def test_set_tip_seq_provider_rejects_non_callable():
+    monitor = PostFlapTipCorrelationMonitor()
+    with pytest.raises(TypeError, match="tip_seq_provider must be callable"):
+        monitor.set_tip_seq_provider(123)  # type: ignore[arg-type]
+
+
+def test_first_connect_without_prior_close_is_noop(caplog):
+    tip = {"seq": 100}
+    monitor = PostFlapTipCorrelationMonitor(
+        tip_seq_provider=lambda: tip["seq"],
+        stale_window_seconds=0.05,
+        url="wss://example/ws/public",
+    )
+    with caplog.at_level(logging.INFO):
+        monitor.note_connection_restored(
+            reconnect_wall_ms=1_000,
+            reconnect_mono_ms=500,
+        )
+    assert not any("post_flap_correlation" in r.message for r in caplog.records)
+    assert not any("post_flap_tip_stale" in r.message for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_flap_logs_structured_correlation_with_tip_before_after(caplog):
+    tip = {"seq": 1_684_815}
+    monitor = PostFlapTipCorrelationMonitor(
+        tip_seq_provider=lambda: tip["seq"],
+        stale_window_seconds=5.0,
+        url="wss://example/ws/public",
+        now_wall_ms=lambda: 9_999,
+        now_mono_ms=lambda: 8_888,
+    )
+
+    with caplog.at_level(logging.INFO):
+        monitor.note_connection_closed(close_wall_ms=1_000, close_mono_ms=100)
+        tip["seq"] = 1_684_815  # unchanged across flap (Day19 signature)
+        monitor.note_connection_restored(
+            reconnect_wall_ms=2_300,
+            reconnect_mono_ms=1_400,
+        )
+
+    messages = [r.message for r in caplog.records]
+    assert any("post_flap_correlation" in m for m in messages)
+    correlation = next(m for m in messages if "post_flap_correlation" in m)
+    assert "close_ts_ms=1000" in correlation
+    assert "reconnect_ts_ms=2300" in correlation
+    assert "since_close_ms=1300" in correlation
+    assert "tip_seq_before=1684815" in correlation
+    assert "tip_seq_after=1684815" in correlation
+    assert "wss://example/ws/public" in correlation
+
+    monitor.cancel()
+
+
+@pytest.mark.asyncio
+async def test_post_flap_tip_stale_warning_when_tip_frozen(caplog):
+    tip = {"seq": 42}
+    monitor = PostFlapTipCorrelationMonitor(
+        tip_seq_provider=lambda: tip["seq"],
+        stale_window_seconds=0.05,
+        url="wss://example/ws/public",
+    )
+    monitor.note_connection_closed(close_wall_ms=10, close_mono_ms=1)
+    monitor.note_connection_restored(reconnect_wall_ms=20, reconnect_mono_ms=11)
+
+    with caplog.at_level(logging.WARNING):
+        await asyncio.sleep(0.12)
+
+    assert any(
+        "post_flap_tip_stale" in r.message and r.levelno == logging.WARNING
+        for r in caplog.records
+    )
+    stale = next(r.message for r in caplog.records if "post_flap_tip_stale" in r.message)
+    assert "tip_seq=42" in stale
+    assert "tip_seq_before=42" in stale
+
+
+@pytest.mark.asyncio
+async def test_no_stale_warning_when_tip_advances(caplog):
+    tip = {"seq": 10}
+    monitor = PostFlapTipCorrelationMonitor(
+        tip_seq_provider=lambda: tip["seq"],
+        stale_window_seconds=0.05,
+    )
+    monitor.note_connection_closed(close_wall_ms=1, close_mono_ms=1)
+    monitor.note_connection_restored(reconnect_wall_ms=2, reconnect_mono_ms=2)
+    tip["seq"] = 11
+
+    with caplog.at_level(logging.WARNING):
+        await asyncio.sleep(0.12)
+
+    assert not any("post_flap_tip_stale" in r.message for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_cancel_suppresses_pending_stale_check(caplog):
+    tip = {"seq": 7}
+    monitor = PostFlapTipCorrelationMonitor(
+        tip_seq_provider=lambda: tip["seq"],
+        stale_window_seconds=0.08,
+    )
+    monitor.note_connection_closed(close_wall_ms=1, close_mono_ms=1)
+    monitor.note_connection_restored(reconnect_wall_ms=2, reconnect_mono_ms=2)
+    monitor.cancel()
+
+    with caplog.at_level(logging.WARNING):
+        await asyncio.sleep(0.15)
+
+    assert not any("post_flap_tip_stale" in r.message for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_flap_without_tip_provider_still_logs_correlation(caplog):
+    monitor = PostFlapTipCorrelationMonitor(
+        tip_seq_provider=None,
+        stale_window_seconds=0.05,
+        url="wss://public",
+    )
+    with caplog.at_level(logging.INFO):
+        monitor.note_connection_closed(close_wall_ms=5, close_mono_ms=5)
+        monitor.note_connection_restored(reconnect_wall_ms=15, reconnect_mono_ms=15)
+
+    assert any("post_flap_correlation" in r.message for r in caplog.records)
+    correlation = next(
+        r.message for r in caplog.records if "post_flap_correlation" in r.message
+    )
+    assert "tip_seq_before=n/a" in correlation
+    assert "tip_seq_after=n/a" in correlation
+
+    with caplog.at_level(logging.WARNING):
+        await asyncio.sleep(0.12)
+    # Without tip access, do not invent a stale tip warning.
+    assert not any("post_flap_tip_stale" in r.message for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_rearm_on_second_flap_cancels_previous_window(caplog):
+    tip = {"seq": 1}
+    monitor = PostFlapTipCorrelationMonitor(
+        tip_seq_provider=lambda: tip["seq"],
+        stale_window_seconds=0.2,
+    )
+    monitor.note_connection_closed(close_wall_ms=1, close_mono_ms=1)
+    monitor.note_connection_restored(reconnect_wall_ms=2, reconnect_mono_ms=2)
+
+    # Second flap shortly after: tip advances before the second window ends.
+    monitor.note_connection_closed(close_wall_ms=3, close_mono_ms=3)
+    monitor.note_connection_restored(reconnect_wall_ms=4, reconnect_mono_ms=4)
+    tip["seq"] = 2
+
+    with caplog.at_level(logging.WARNING):
+        await asyncio.sleep(0.25)
+
+    assert not any("post_flap_tip_stale" in r.message for r in caplog.records)
+
+
+def test_base_stream_wires_tip_seq_provider_from_journal(tmp_path, mocker):
+    """Collector journal dispatch auto-binds tip sampling on the WS manager."""
+    from core.journal.journal_dispatch_decorator import JournalDispatchDecorator
+    from core.journal.tick_journal import TickJournal
+    from core.routing.sink_dispatch_strategy import SinkDispatchStrategy
+    from exchanges.bitget.bitget_subscription_protocol import BitgetSubscriptionProtocol
+    from exchanges.bitget.bitget_tick_stream import BitgetTickStream
+    from exchanges.bitget.parsing.bitget_message_parser import BitgetMessageParser
+
+    journal = TickJournal(str(tmp_path))
+    dispatch = JournalDispatchDecorator(SinkDispatchStrategy(), journal)
+    mgr = ReconnectingWebSocketManager(
+        "wss://example/ws/public",
+        RetryPolicy(max_retries=1),
+        SilenceWatchdog(),
+        KeepAliveEmitter(),
+    )
+    set_provider = mocker.spy(mgr, "set_tip_seq_provider")
+
+    BitgetTickStream(
+        network_manager=mgr,
+        subscription_strategy=BitgetSubscriptionProtocol("USDT-FUTURES"),
+        parsing_strategy=BitgetMessageParser.create_default(),
+        dispatch_strategy=dispatch,
+        symbols=["XRPUSDT"],
+    )
+
+    set_provider.assert_called_once()
+    provider = set_provider.call_args.args[0]
+    assert provider() == journal.latest_seq()
+
+
+def test_monitor_rejects_non_callable_tip_provider_and_non_string_url():
+    with pytest.raises(TypeError, match="tip_seq_provider must be callable"):
+        PostFlapTipCorrelationMonitor(tip_seq_provider=object())  # type: ignore[arg-type]
+    with pytest.raises(TypeError, match="url must be a string"):
+        PostFlapTipCorrelationMonitor(url=123)  # type: ignore[arg-type]
+
+
+def test_set_url_and_stale_window_type_errors():
+    monitor = PostFlapTipCorrelationMonitor(url="wss://x")
+    assert monitor.url == "wss://x"
+    with pytest.raises(TypeError, match="url must be a string"):
+        monitor.set_url(None)  # type: ignore[arg-type]
+    with pytest.raises(TypeError, match="stale_window_seconds must be a number"):
+        monitor.set_stale_window_seconds("fast")  # type: ignore[arg-type]
+    monitor.set_url("wss://y")
+    assert monitor.url == "wss://y"
+
+
+def test_sample_tip_seq_handles_provider_errors_and_invalid_values():
+    monitor = PostFlapTipCorrelationMonitor(
+        tip_seq_provider=lambda: (_ for _ in ()).throw(RuntimeError("boom")),
+        stale_window_seconds=0.05,
+    )
+    monitor.note_connection_closed(close_wall_ms=1, close_mono_ms=1)
+    # Provider raised → tip_before is None → restore logs correlation without stale arm.
+    monitor.note_connection_restored(reconnect_wall_ms=2, reconnect_mono_ms=2)
+
+    for bad in (None, "x", -1):
+        m = PostFlapTipCorrelationMonitor(
+            tip_seq_provider=lambda bad=bad: bad,
+            stale_window_seconds=0.05,
+        )
+        m.note_connection_closed(close_wall_ms=1, close_mono_ms=1)
+        m.note_connection_restored(reconnect_wall_ms=2, reconnect_mono_ms=2)
+
+
+@pytest.mark.asyncio
+async def test_stale_check_skips_when_tip_now_none_or_generation_mismatch(caplog):
+    tip = {"seq": 5, "fail": False}
+    monitor = PostFlapTipCorrelationMonitor(
+        tip_seq_provider=lambda: None if tip["fail"] else tip["seq"],
+        stale_window_seconds=0.05,
+    )
+    monitor.note_connection_closed(close_wall_ms=1, close_mono_ms=1)
+    monitor.note_connection_restored(reconnect_wall_ms=2, reconnect_mono_ms=2)
+    tip["fail"] = True
+    with caplog.at_level(logging.WARNING):
+        await asyncio.sleep(0.12)
+    assert not any("post_flap_tip_stale" in r.message for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_stale_elapsed_ms_falls_back_when_wall_clock_raises(caplog):
+    tip = {"seq": 9}
+
+    def _wall():
+        raise RuntimeError("clock broken")
+
+    monitor = PostFlapTipCorrelationMonitor(
+        tip_seq_provider=lambda: tip["seq"],
+        stale_window_seconds=0.05,
+        now_wall_ms=_wall,
+    )
+    monitor.note_connection_closed(close_wall_ms=10, close_mono_ms=1)
+    monitor.note_connection_restored(reconnect_wall_ms=20, reconnect_mono_ms=11)
+    with caplog.at_level(logging.WARNING):
+        await asyncio.sleep(0.12)
+    stale = next(r.message for r in caplog.records if "post_flap_tip_stale" in r.message)
+    assert "elapsed_since_reconnect_ms=50" in stale  # window_s * 1000 fallback
+
+
+@pytest.mark.asyncio
+async def test_cancel_during_stale_window_propagates_cancelled_error():
+    tip = {"seq": 1}
+    monitor = PostFlapTipCorrelationMonitor(
+        tip_seq_provider=lambda: tip["seq"],
+        stale_window_seconds=1.0,
+    )
+    monitor.note_connection_closed(close_wall_ms=1, close_mono_ms=1)
+    monitor.note_connection_restored(reconnect_wall_ms=2, reconnect_mono_ms=2)
+    await asyncio.sleep(0)  # start sleeping inside watchdog
+    task = monitor._PostFlapTipCorrelationMonitor__watchdog_task
+    assert task is not None
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+
+@pytest.mark.asyncio
+async def test_stale_check_aborts_on_generation_mismatch(caplog):
+    tip = {"seq": 5}
+    monitor = PostFlapTipCorrelationMonitor(
+        tip_seq_provider=lambda: tip["seq"],
+        stale_window_seconds=0.05,
+    )
+    monitor.note_connection_closed(close_wall_ms=1, close_mono_ms=1)
+    monitor.note_connection_restored(reconnect_wall_ms=2, reconnect_mono_ms=2)
+    # Bump generation without cancelling the in-flight sleep task.
+    monitor._PostFlapTipCorrelationMonitor__generation += 1
+    with caplog.at_level(logging.WARNING):
+        await asyncio.sleep(0.12)
+    assert not any("post_flap_tip_stale" in r.message for r in caplog.records)

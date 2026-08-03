@@ -11,6 +11,10 @@ import websockets
 from websockets.exceptions import ConnectionClosed
 
 from core.interfaces.base import IRetryPolicy, IWatchdog, IHeartbeat
+from core.network.post_flap_tip_correlation import (
+    PostFlapTipCorrelationMonitor,
+    TipSeqProvider,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -187,6 +191,11 @@ class ReconnectingWebSocketManager:
         self.__health_task: Optional[asyncio.Task] = None
         self.__keep_alive_task: Optional[asyncio.Task] = None
         self.__log_seq = 0
+        self.__flap_tip_monitor = PostFlapTipCorrelationMonitor(
+            url=self.__url,
+            now_wall_ms=self.__now_wall_ms,
+            now_mono_ms=self.__now_monotonic_ms,
+        )
 
     def __next_log_seq(self) -> int:
         self.__log_seq += 1
@@ -235,6 +244,20 @@ class ReconnectingWebSocketManager:
         if not inspect.iscoroutinefunction(callback):
             raise TypeError("callback must be an async function")
         self.__on_connect_callback = callback
+
+    def set_tip_seq_provider(self, provider: Optional[TipSeqProvider]) -> None:
+        """
+        Bind an optional tip-seq sampler for post-flap correlation telemetry.
+
+        When set, public WS flaps log tip_seq before/after reconnect and may emit
+        ``post_flap_tip_stale`` if the tip does not advance in the observation window.
+        """
+        self.__flap_tip_monitor.set_tip_seq_provider(provider)
+
+    @property
+    def flap_tip_monitor(self) -> PostFlapTipCorrelationMonitor:
+        """Return the post-flap tip correlation monitor (WATCH Day19 #2)."""
+        return self.__flap_tip_monitor
 
     def is_stopped(self) -> bool:
         """Return True if the manager has been stopped."""
@@ -302,6 +325,7 @@ class ReconnectingWebSocketManager:
     async def stop(self) -> None:
         """Stop the manager, cancel background tasks, and close any active connection."""
         self.__stop_event.set()
+        self.__flap_tip_monitor.cancel()
         await self.__cancel_background_task(self.__health_task)
         await self.__cancel_background_task(self.__keep_alive_task)
         self.__health_task = None
@@ -399,11 +423,13 @@ class ReconnectingWebSocketManager:
                 try:
                     self.__ws = ws
                     connected_seq = self.__next_log_seq()
+                    reconnect_wall_ms = self.__now_wall_ms()
+                    reconnect_mono_ms = self.__now_monotonic_ms()
                     logger.info(
                         "WebSocket connecté avec succès seq=%s event_ts_ms=%s event_mono_ms=%s",
                         connected_seq,
-                        self.__now_wall_ms(),
-                        self.__now_monotonic_ms(),
+                        reconnect_wall_ms,
+                        reconnect_mono_ms,
                     )
                     logger.debug(
                         "WebSocket session started url=%s",
@@ -411,6 +437,10 @@ class ReconnectingWebSocketManager:
                     )
                     attempt = 0
                     self.__watchdog.ping()
+                    self.__flap_tip_monitor.note_connection_restored(
+                        reconnect_wall_ms=reconnect_wall_ms,
+                        reconnect_mono_ms=reconnect_mono_ms,
+                    )
 
                     health_task = asyncio.create_task(self.__health_loop())
                     keep_alive_task = asyncio.create_task(
@@ -437,6 +467,10 @@ class ReconnectingWebSocketManager:
                             last_close_wall_ms,
                             last_close_mono_ms,
                             diagnostic,
+                        )
+                        self.__flap_tip_monitor.note_connection_closed(
+                            close_wall_ms=last_close_wall_ms,
+                            close_mono_ms=last_close_mono_ms,
                         )
                         preparing_seq = self.__next_log_seq()
                         logger.debug(

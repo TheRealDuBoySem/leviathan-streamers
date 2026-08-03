@@ -2,7 +2,7 @@ import asyncio
 import inspect
 import logging
 from abc import ABC
-from typing import Optional, List, AsyncIterator, Callable, Awaitable
+from typing import Optional, List, AsyncIterator, Callable, Awaitable, Set
 
 from core.models.trade_tick import TradeTick
 from core.models.messages import TradeMessage, SystemMessage, ErrorMessage
@@ -11,6 +11,7 @@ from core.state.subscription_confirmation_tracker import (
     DEFAULT_CONFIRMATION_TIMEOUT_SECONDS,
     SubscriptionConfirmationTracker,
 )
+from core.state.post_reconnect_write_liveness import PostReconnectWriteLivenessGuard
 from core.network.reconnecting_ws_manager import ReconnectingWebSocketManager
 from core.interfaces.base import (
     IExchangeStream,
@@ -94,6 +95,7 @@ class BaseExchangeStream(IExchangeStream, ABC):
         dispatch_strategy: IDispatchStrategy,
         symbols: Optional[List[str]] = None,
         confirmation_timeout_seconds: float = DEFAULT_CONFIRMATION_TIMEOUT_SECONDS,
+        write_liveness_guard: Optional[PostReconnectWriteLivenessGuard] = None,
     ):
         _validate_network_manager(network_manager)
         if not isinstance(subscription_strategy, ISubscriptionStrategy):
@@ -104,6 +106,12 @@ class BaseExchangeStream(IExchangeStream, ABC):
             raise TypeError("dispatch_strategy must be a IDispatchStrategy instance")
         if symbols is not None:
             _validate_initial_symbols(symbols)
+        if write_liveness_guard is not None and not isinstance(
+            write_liveness_guard, PostReconnectWriteLivenessGuard
+        ):
+            raise TypeError(
+                "write_liveness_guard must be a PostReconnectWriteLivenessGuard instance"
+            )
 
         self.__registry = SubscriptionRegistry(initial_symbols=symbols)
         self.__subscription_strategy = subscription_strategy
@@ -112,14 +120,60 @@ class BaseExchangeStream(IExchangeStream, ABC):
         self.__network_manager = network_manager
         self.__observers: List[IPriceObserver] = []
         self.__on_reconnect_callbacks: List[Callable[[], Awaitable[None]]] = []
+        self.__write_liveness_guard = write_liveness_guard
         self.__confirmation_tracker = SubscriptionConfirmationTracker(
             timeout_seconds=confirmation_timeout_seconds,
+            on_complete=self.__on_subscriptions_confirmed,
         )
 
         self.__network_manager.set_on_connect_callback(self.__handle_connect)
+        self.__wire_flap_tip_correlation()
+
+    def __wire_flap_tip_correlation(self) -> None:
+        """
+        Bind tip-seq sampling for post-flap correlation when a journal is reachable.
+
+        Complements BB-B5-A1 write-liveness: telemetry only (WATCH Day19 #2).
+        """
+        set_provider = getattr(self.__network_manager, "set_tip_seq_provider", None)
+        if not callable(set_provider):
+            return
+        provider = self.__resolve_tip_seq_provider()
+        if provider is not None:
+            set_provider(provider)
+
+    def __resolve_tip_seq_provider(self):
+        """Return a tip-seq callable from a journal-backed dispatch strategy, if any."""
+        journal = getattr(self.__dispatch_strategy, "journal", None)
+        if journal is None:
+            return None
+        latest_seq = getattr(journal, "latest_seq", None)
+        if not callable(latest_seq):
+            return None
+
+        def _tip_seq_provider():
+            value = latest_seq()
+            if value is None:
+                return None
+            return int(value)
+
+        return _tip_seq_provider
+
+    def __on_subscriptions_confirmed(self, confirmed: Set[str]) -> None:
+        """Log full ack, then arm post-reconnect journal write-liveness (BB-B5-A1)."""
+        logger.info(
+            "Abonnements confirmés après reconnect: demandés=%s, confirmés=%s",
+            sorted(confirmed),
+            sorted(confirmed),
+        )
+        if self.__write_liveness_guard is not None:
+            self.__write_liveness_guard.arm_after_subscriptions_confirmed(set(confirmed))
 
     async def __handle_connect(self) -> None:
         """Notifies reconnect listeners before resubscribing so backfill session state is reset first."""
+        if self.__write_liveness_guard is not None:
+            # Drop any prior write deadline; re-arm only after the new confirms.
+            self.__write_liveness_guard.cancel()
         for callback in list(self.__on_reconnect_callbacks):
             try:
                 await callback()
@@ -184,6 +238,11 @@ class BaseExchangeStream(IExchangeStream, ABC):
     def confirmation_tracker(self) -> SubscriptionConfirmationTracker:
         """Return the subscription confirmation tracker (reconnect acks)."""
         return self.__confirmation_tracker
+
+    @property
+    def write_liveness_guard(self) -> Optional[PostReconnectWriteLivenessGuard]:
+        """Return the optional post-reconnect journal write-liveness guard."""
+        return self.__write_liveness_guard
 
     # Pattern: Observer (Observable part)
     def attach_observer(self, observer: IPriceObserver) -> None:
@@ -270,6 +329,8 @@ class BaseExchangeStream(IExchangeStream, ABC):
 
     async def stop(self) -> None:
         self.__confirmation_tracker.cancel()
+        if self.__write_liveness_guard is not None:
+            self.__write_liveness_guard.cancel()
         await self.__network_manager.stop()
 
     async def _resubscribe_all(self) -> None:
