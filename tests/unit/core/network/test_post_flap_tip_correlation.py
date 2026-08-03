@@ -155,6 +155,42 @@ async def test_post_flap_tip_stale_invokes_on_stale_heal_callback(caplog):
 
 
 @pytest.mark.asyncio
+async def test_j21_h20_tip_1684815_stagnant_after_1250ms_flap_heals(caplog):
+    """J21 H20 chronology: ~1.25s public flap, tip 1684815 frozen → CRITICAL heal."""
+    tip = {"seq": 1_684_815}
+    stale_calls: list[tuple[int, int, float]] = []
+    monitor = PostFlapTipCorrelationMonitor(
+        tip_seq_provider=lambda: tip["seq"],
+        stale_window_seconds=0.05,
+        url="wss://ws.bitget.com/v2/ws/public",
+        on_stale=lambda before, now, elapsed: stale_calls.append((before, now, elapsed)),
+        min_heal_interval_seconds=0.0,
+    )
+
+    with caplog.at_level(logging.INFO):
+        monitor.note_connection_closed(close_wall_ms=20_15_14_646, close_mono_ms=100)
+        monitor.note_connection_restored(
+            reconnect_wall_ms=20_15_15_893,
+            reconnect_mono_ms=1_350,  # +1250 ms since close
+        )
+        await asyncio.sleep(0.12)
+
+    assert len(stale_calls) == 1
+    assert stale_calls[0][:2] == (1_684_815, 1_684_815)
+    correlation = next(r.message for r in caplog.records if "post_flap_correlation" in r.message)
+    assert "since_close_ms=1250" in correlation
+    assert "tip_seq_before=1684815" in correlation
+    assert "tip_seq_after=1684815" in correlation
+    assert any(
+        "post_flap_tip_stale" in r.message
+        and r.levelno >= logging.CRITICAL
+        and "BB-B5-A1" in r.message
+        and f"exit_code={COLLECTOR_POST_FLAP_TIP_STALE_EXIT_CODE}" in r.message
+        for r in caplog.records
+    )
+
+
+@pytest.mark.asyncio
 async def test_post_flap_tip_stale_without_callback_still_logs_critical(caplog):
     tip = {"seq": 7}
     monitor = PostFlapTipCorrelationMonitor(

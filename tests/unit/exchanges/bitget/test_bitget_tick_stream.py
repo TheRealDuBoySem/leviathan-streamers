@@ -869,6 +869,121 @@ async def test_full_confirmation_arms_write_liveness_then_stale_without_writes(
 
 
 @pytest.mark.asyncio
+async def test_j21_h20_flap_confirm_tip_stagnant_triggers_dual_heal(
+    mocker, mock_ws_manager, mock_parser, caplog, tmp_path
+):
+    """J21 H20 BB-B5-A1 regression: flap→~1.25s reconnect→sub XRPUSDT OK→tip frozen.
+
+    Chronology (beta 2026-08-01 @20:15):
+      WS public close → reconnect ~1.25s → sub XRPUSDT confirmed → tip stays
+      ``1684815``, 0 ticks. Collector must CRITICAL + self-heal on both paths:
+      post-flap tip correlation AND post-confirm write-liveness.
+    """
+    import logging
+
+    from core.journal.journal_dispatch_decorator import JournalDispatchDecorator
+    from core.journal.tick_journal import TickJournal
+    from core.routing.sink_dispatch_strategy import SinkDispatchStrategy
+    from core.state.post_reconnect_write_liveness import (
+        COLLECTOR_WRITE_LIVENESS_EXIT_CODE,
+        PostReconnectWriteLivenessGuard,
+    )
+
+    tip_seq = 1_684_815
+    write_stale: list[set[str]] = []
+    flap_stale: list[tuple[int, int, float]] = []
+
+    guard = PostReconnectWriteLivenessGuard(
+        timeout_seconds=0.05,
+        min_heal_interval_seconds=0.0,
+        on_stale=lambda symbols, _elapsed: write_stale.append(set(symbols)),
+    )
+    # Real journal-backed dispatch (as in run_collector); tip seq pinned below to
+    # the J21 frozen value without writing 1.6M ticks.
+    journal = TickJournal(str(tmp_path))
+    dispatch = JournalDispatchDecorator(
+        SinkDispatchStrategy(),
+        journal,
+        write_liveness_guard=guard,
+    )
+
+    captured, original = _capture_on_connect_callback(mock_ws_manager)
+    stream = BitgetTickStream(
+        network_manager=mock_ws_manager,
+        subscription_strategy=BitgetSubscriptionProtocol(inst_type="mc"),
+        parsing_strategy=mock_parser,
+        dispatch_strategy=dispatch,
+        symbols=["XRPUSDT"],
+        confirmation_timeout_seconds=1.0,
+        write_liveness_guard=guard,
+    )
+    mock_ws_manager.set_on_connect_callback = original
+    # Pin tip sampler to J21 frozen seq (journal may be empty in unit test).
+    mock_ws_manager.set_tip_seq_provider(lambda: tip_seq)
+    mock_ws_manager.set_on_post_flap_tip_stale(
+        lambda before, now, elapsed: flap_stale.append((before, now, elapsed))
+    )
+    mock_ws_manager.flap_tip_monitor.set_stale_window_seconds(0.05)
+    mock_ws_manager.flap_tip_monitor.set_min_heal_interval_seconds(0.0)
+
+    mocker.patch(
+        "core.network.reconnecting_ws_manager.ReconnectingWebSocketManager.send",
+        new_callable=AsyncMock,
+    )
+
+    # Boot connect (gen=1) — satisfy first write-liveness so only the post-flap
+    # confirm window is under test (mirrors long-lived collector before H20 flap).
+    await captured[0]()
+    assert stream.connect_generation == 1
+    guard.arm_after_subscriptions_confirmed({"XRPUSDT"}, connect_generation=1)
+    guard.record_journal_write()
+    assert guard.is_awaiting_write() is False
+
+    async def mock_listen():
+        yield orjson_subscribe_ack("XRPUSDT")
+        await asyncio.sleep(0.18)
+
+    mocker.patch.object(
+        stream.network_manager,
+        "start_connection_and_listen",
+        side_effect=mock_listen,
+    )
+
+    with caplog.at_level(logging.INFO):
+        # J21 H20 flap: close → reconnect ~1.25s, tip unchanged at 1684815.
+        mock_ws_manager.flap_tip_monitor.note_connection_closed(
+            close_wall_ms=1_000, close_mono_ms=100
+        )
+        mock_ws_manager.flap_tip_monitor.note_connection_restored(
+            reconnect_wall_ms=2_250, reconnect_mono_ms=1_350
+        )
+
+        # Post-flap connect (gen=2) cancels any prior write window; re-arm after confirm.
+        await captured[0]()
+        assert stream.connect_generation == 2
+        await stream.start_streaming()
+
+    assert write_stale == [{"XRPUSDT"}]
+    assert len(flap_stale) == 1
+    assert flap_stale[0][:2] == (tip_seq, tip_seq)
+    assert any(
+        "post_flap_correlation" in r.message
+        and "tip_seq_before=1684815" in r.message
+        and "since_close_ms=1250" in r.message
+        for r in caplog.records
+    )
+    assert any(
+        "post_flap_tip_stale" in r.message and r.levelno >= logging.CRITICAL
+        for r in caplog.records
+    )
+    assert any(
+        r.levelno >= logging.CRITICAL and "BB-B5-A1" in r.message
+        for r in caplog.records
+    )
+    assert COLLECTOR_WRITE_LIVENESS_EXIT_CODE == 1
+
+
+@pytest.mark.asyncio
 async def test_first_boot_confirm_arms_write_liveness_mute_tip_heal(
     mocker, mock_ws_manager, mock_parser, caplog
 ):
