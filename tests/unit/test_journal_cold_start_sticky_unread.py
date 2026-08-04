@@ -194,20 +194,22 @@ def test_read_progress_snapshot_latest_seq_not_stale_vs_reader_progress(tmp_path
 
 def test_read_progress_snapshot_coerces_production_stale_meta_watermark(tmp_path):
     """
-    D6-A04 / D5-08: reproduce H00-A03 pattern — disk meta frozen at 545482 while
-    the reader has already consumed far ahead (next_seq ~552k). Snapshot must
-    never report latest_seq << next_seq - 1 when those seqs were consumed.
+    D6-A04 / D5-08 within META_PERSIST lag: disk meta may lag the reader by a
+    small persist window; snapshot latest_seq must still reflect consumed floor.
+
+    Large checkpoint cursor overhang past live disk tip is BB-D23-02 sticky
+    tip-split (see test_read_progress_snapshot_rejects_sticky_cursor_overhang).
     """
-    stale_watermark = 545_482
-    consumed_through = 552_039
+    from core.journal.tick_journal import META_PERSIST_INTERVAL
+
+    stale_watermark = 100
+    consumed_through = stale_watermark + (META_PERSIST_INTERVAL // 2)
     journal = TickJournal(str(tmp_path))
     journal.append(_tick("seed"))
-    # Force the exact stale disk tip seen in 2026-07-17 logs.
     _seed_journal_meta(journal, tmp_path, latest_seq=stale_watermark)
     assert journal.read_latest_seq_from_disk() == stale_watermark
 
     reader = JournalIncrementalReader(journal)
-    # Simulate a caught-up reader that already walked past the stale meta tip.
     reader._JournalIncrementalReader__next_seq = consumed_through + 1
     try:
         reader._JournalIncrementalReader__read_offset = os.path.getsize(
@@ -222,6 +224,37 @@ def test_read_progress_snapshot_coerces_production_stale_meta_watermark(tmp_path
     assert snapshot["latest_seq"] >= snapshot["next_seq"] - 1
     assert snapshot["latest_seq"] > stale_watermark
     assert snapshot["lag_seq"] == 0
+    assert snapshot.get("cursor_ahead_of_tip") is False
+
+
+def test_read_progress_snapshot_rejects_sticky_cursor_overhang(tmp_path):
+    """
+    BB-D23-02: checkpoint cursor far past live disk tip must not invent a
+    sticky tip (J23 H05 dual tip / famine until catch-up).
+    """
+    from core.journal.tick_journal import META_PERSIST_INTERVAL
+
+    live_tip = 1_740_532
+    sticky_cursor = 1_741_629
+    assert sticky_cursor - live_tip > META_PERSIST_INTERVAL
+    journal = TickJournal(str(tmp_path))
+    journal.append(_tick("seed"))
+    _seed_journal_meta(journal, tmp_path, latest_seq=live_tip)
+
+    reader = JournalIncrementalReader(journal)
+    reader._JournalIncrementalReader__next_seq = sticky_cursor + 1
+    try:
+        reader._JournalIncrementalReader__read_offset = os.path.getsize(
+            journal.journal_path
+        )
+    except OSError:
+        reader._JournalIncrementalReader__read_offset = 0
+
+    snapshot = reader.get_read_progress_snapshot()
+    assert snapshot["latest_seq"] == live_tip
+    assert snapshot["cursor_ahead_of_tip"] is True
+    assert snapshot["next_seq"] == sticky_cursor + 1
+
 
 
 @pytest.mark.asyncio

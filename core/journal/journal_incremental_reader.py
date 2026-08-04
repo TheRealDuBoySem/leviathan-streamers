@@ -23,6 +23,9 @@ logger = logging.getLogger(__name__)
 
 # D4-09: bound wait for a `{`-prefixed incomplete trailing write before skipping.
 DEFAULT_INCOMPLETE_RECORD_MAX_WAIT_SECONDS = 2.0
+# Align with TickJournal.META_PERSIST_INTERVAL — tip inflate past disk only within
+# this window; larger overhang is sticky cursor (BB-D23-02).
+_TIP_META_LAG_TOLERANCE_SEQ = 50
 
 
 def is_in_progress_journal_fragment(fragment: str) -> bool:
@@ -170,9 +173,16 @@ class JournalIncrementalReader:
         except OSError:
             journal_size = 0
         disk_latest = self.__journal.read_latest_seq_from_disk()
-        # Records already consumed imply tip >= next_seq - 1 even if meta lags.
+        # Records already consumed imply tip >= next_seq - 1 even if meta lags —
+        # but only within META_PERSIST lag. A checkpoint cursor past the live
+        # disk tip (BB-D23-02 sticky watermark) must not invent a phantom tip.
         observed_floor = max(0, self.__next_seq - 1)
-        latest_seq = max(int(disk_latest), observed_floor)
+        overhang = observed_floor - int(disk_latest)
+        cursor_ahead_of_tip = overhang > _TIP_META_LAG_TOLERANCE_SEQ
+        if cursor_ahead_of_tip:
+            latest_seq = int(disk_latest)
+        else:
+            latest_seq = max(int(disk_latest), observed_floor)
         if latest_seq >= self.__next_seq:
             lag_seq = latest_seq - self.__next_seq + 1
         else:
@@ -188,6 +198,7 @@ class JournalIncrementalReader:
             "latest_seq": latest_seq,
             "lag_seq": lag_seq,
             "incomplete_stuck": incomplete_stuck,
+            "cursor_ahead_of_tip": cursor_ahead_of_tip,
         }
 
     def poll(self, start_seq: int) -> list[tuple[int, TradeTick]]:
