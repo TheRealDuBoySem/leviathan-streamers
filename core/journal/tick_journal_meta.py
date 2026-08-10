@@ -31,6 +31,9 @@ class TickJournalMetaStore:
         self.__dedup_window = dedup_window
         self.__payload = self.load_payload(self.__meta_path)
         self.__dedup_buckets = self.__hydrate_dedup_buckets()
+        # BB-D23-02: coherent tip high-water — never report a phantom rewind
+        # below a previously observed durable disk tip (J24 latest=1790634).
+        self.__disk_tip_high_water = int(self.__payload.get("latest_seq", 0))
 
     @property
     def meta_path(self) -> str:
@@ -110,18 +113,33 @@ class TickJournalMetaStore:
         """
         Return latest_seq from persisted meta without mutating in-memory state.
 
-        Falls back to the in-memory latest_seq when disk meta is unreadable.
+        Falls back to the coherent high-water (max of in-memory tip and last
+        successful disk observation) when disk meta is unreadable.
+
+        BB-D23-02: rejects phantom tip rewinds below the observed high-water
+        (J24 soft-stale/stall with sticky ``latest=1790634``). High-water
+        advances only on successful disk reads — not on unpersisted in-memory
+        ``set_latest_seq`` — so META_PERSIST lag stays honest.
         """
         try:
             meta = self.load_payload(self.__meta_path)
         except (OSError, json.JSONDecodeError, ValueError):
-            return self.latest_seq()
-        return int(meta.get("latest_seq", 0))
+            return max(int(self.latest_seq()), int(self.__disk_tip_high_water))
+        raw = int(meta.get("latest_seq", 0))
+        if raw < 0:
+            raw = 0
+        if raw < self.__disk_tip_high_water:
+            return int(self.__disk_tip_high_water)
+        self.__disk_tip_high_water = raw
+        return raw
 
     def reload_from_disk(self) -> None:
         """Replace in-memory payload and dedup buckets from disk."""
         self.__payload = self.load_payload(self.__meta_path)
         self.__dedup_buckets = self.__hydrate_dedup_buckets()
+        loaded_tip = int(self.__payload.get("latest_seq", 0))
+        if loaded_tip > self.__disk_tip_high_water:
+            self.__disk_tip_high_water = loaded_tip
 
     def reload_seq_index_from_disk(self) -> None:
         """

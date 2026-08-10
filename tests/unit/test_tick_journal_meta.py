@@ -64,6 +64,51 @@ def test_meta_store_read_latest_seq_from_disk_falls_back_on_corrupt_meta(tmp_pat
     assert store.read_latest_seq_from_disk() == 3
 
 
+def test_meta_store_read_latest_seq_rejects_phantom_disk_rewind(tmp_path):
+    """
+    BB-D23-02: after observing a high disk tip, a stale/boot-era tip must not
+    surface (J24 phantom latest=1790634 while live ~1810k).
+    """
+    meta_path = tmp_path / "tick_journal.meta.json"
+    with open(meta_path, "w", encoding="utf-8") as handle:
+        json.dump(
+            {"latest_seq": 1_810_634, "seen_trade_ids": {}, "seq_index": [[0, 0]]},
+            handle,
+        )
+    store = TickJournalMetaStore(str(meta_path), dedup_window=10)
+    assert store.read_latest_seq_from_disk() == 1_810_634
+
+    with open(meta_path, "w", encoding="utf-8") as handle:
+        json.dump(
+            {"latest_seq": 1_790_634, "seen_trade_ids": {}, "seq_index": [[0, 0]]},
+            handle,
+        )
+    assert store.read_latest_seq_from_disk() == 1_810_634
+
+
+def test_meta_store_read_latest_seq_fallback_keeps_disk_high_water(tmp_path, mocker):
+    """
+    Transient meta I/O must not fall back to a boot-era in-memory tip below the
+    last coherent disk high-water (H11 stall precursor).
+    """
+    meta_path = tmp_path / "tick_journal.meta.json"
+    with open(meta_path, "w", encoding="utf-8") as handle:
+        json.dump(
+            {"latest_seq": 1_810_647, "seen_trade_ids": {}, "seq_index": [[0, 0]]},
+            handle,
+        )
+    store = TickJournalMetaStore(str(meta_path), dedup_window=10)
+    assert store.read_latest_seq_from_disk() == 1_810_647
+    # Simulate engine boot-era in-memory tip (deploy watermark).
+    store.set_latest_seq(1_790_634)
+    mocker.patch.object(
+        TickJournalMetaStore,
+        "load_payload",
+        side_effect=OSError("race with collector persist"),
+    )
+    assert store.read_latest_seq_from_disk() == 1_810_647
+
+
 def test_meta_store_reload_seq_index_tolerates_bad_meta(tmp_path, mocker):
     store = TickJournalMetaStore(str(tmp_path / "m.json"), dedup_window=10)
     store.replace_seq_index([[0, 0], [1, 10]])
@@ -150,3 +195,12 @@ def test_meta_store_get_or_create_bucket_rejects_blank_symbol(tmp_path):
     store = TickJournalMetaStore(str(tmp_path / "m.json"), dedup_window=10)
     with pytest.raises(ValueError, match="symbol must be a non-empty string"):
         store.get_or_create_bucket("  ")
+
+
+def test_meta_store_read_latest_seq_clamps_negative_disk_tip(tmp_path):
+    """BB-D23-02: negative latest_seq on disk is clamped to 0 before high-water."""
+    meta_path = tmp_path / "tick_journal.meta.json"
+    with open(meta_path, "w", encoding="utf-8") as handle:
+        json.dump({"latest_seq": -7, "seen_trade_ids": {}, "seq_index": []}, handle)
+    store = TickJournalMetaStore(str(meta_path), dedup_window=10)
+    assert store.read_latest_seq_from_disk() == 0
