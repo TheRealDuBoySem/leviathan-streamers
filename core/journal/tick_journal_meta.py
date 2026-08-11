@@ -31,8 +31,9 @@ class TickJournalMetaStore:
         self.__dedup_window = dedup_window
         self.__payload = self.load_payload(self.__meta_path)
         self.__dedup_buckets = self.__hydrate_dedup_buckets()
-        # BB-D23-02: coherent tip high-water — never report a phantom rewind
-        # below a previously observed durable disk tip (J24 latest=1790634).
+        # BB-D23-02 / J25: coherent tip high-water — never report a phantom
+        # rewind below a previously observed durable disk tip
+        # (J24 latest=1790634; J25 soft-stale sticky latest=1810648).
         self.__disk_tip_high_water = int(self.__payload.get("latest_seq", 0))
 
     @property
@@ -116,9 +117,10 @@ class TickJournalMetaStore:
         Falls back to the coherent high-water (max of in-memory tip and last
         successful disk observation) when disk meta is unreadable.
 
-        BB-D23-02: rejects phantom tip rewinds below the observed high-water
-        (J24 soft-stale/stall with sticky ``latest=1790634``). High-water
-        advances only on successful disk reads — not on unpersisted in-memory
+        BB-D23-02 / J25: rejects phantom tip rewinds below the observed
+        high-water (J24 sticky ``latest=1790634``; J25 soft-stale sticky
+        ``latest=1810648`` while live ~1.85M–1.91M). High-water advances
+        only on successful disk reads — not on unpersisted in-memory
         ``set_latest_seq`` — so META_PERSIST lag stays honest.
         """
         try:
@@ -134,12 +136,25 @@ class TickJournalMetaStore:
         return raw
 
     def reload_from_disk(self) -> None:
-        """Replace in-memory payload and dedup buckets from disk."""
+        """
+        Replace in-memory payload and dedup buckets from disk.
+
+        BB-D23-02 / J25: ``latest_seq`` is clamped to the coherent high-water so
+        a phantom disk rewind (e.g. ``1810648`` after ~1.9M) cannot poison
+        ``latest_seq()`` / soft-stale diagnostics that bypass
+        ``read_latest_seq_from_disk``. Dedup buckets and seq_index still reload
+        from disk as written.
+        """
         self.__payload = self.load_payload(self.__meta_path)
         self.__dedup_buckets = self.__hydrate_dedup_buckets()
         loaded_tip = int(self.__payload.get("latest_seq", 0))
-        if loaded_tip > self.__disk_tip_high_water:
+        if loaded_tip < 0:
+            loaded_tip = 0
+        if loaded_tip < self.__disk_tip_high_water:
+            loaded_tip = int(self.__disk_tip_high_water)
+        else:
             self.__disk_tip_high_water = loaded_tip
+        self.__payload["latest_seq"] = loaded_tip
 
     def reload_seq_index_from_disk(self) -> None:
         """

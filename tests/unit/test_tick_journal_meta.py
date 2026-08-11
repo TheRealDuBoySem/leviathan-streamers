@@ -86,6 +86,84 @@ def test_meta_store_read_latest_seq_rejects_phantom_disk_rewind(tmp_path):
     assert store.read_latest_seq_from_disk() == 1_810_634
 
 
+def test_j25_read_latest_seq_rejects_phantom_1810648(tmp_path):
+    """
+    J25 WATCH / BB-D23-02: soft-stale dumps showed sticky latest_seq=1810648
+    while live tip was ~1.85M–1.91M (H04–H06, H15, H17–H20, H22). After a
+    coherent ~1.9M disk observation, raw 1810648 must not surface as tip.
+    """
+    meta_path = tmp_path / "tick_journal.meta.json"
+    high_water = 1_900_000
+    phantom = 1_810_648
+    with open(meta_path, "w", encoding="utf-8") as handle:
+        json.dump(
+            {"latest_seq": high_water, "seen_trade_ids": {}, "seq_index": [[0, 0]]},
+            handle,
+        )
+    store = TickJournalMetaStore(str(meta_path), dedup_window=10)
+    assert store.read_latest_seq_from_disk() == high_water
+
+    with open(meta_path, "w", encoding="utf-8") as handle:
+        json.dump(
+            {"latest_seq": phantom, "seen_trade_ids": {}, "seq_index": [[0, 0]]},
+            handle,
+        )
+    assert store.read_latest_seq_from_disk() == high_water
+    assert store.read_latest_seq_from_disk() != phantom
+
+
+def test_j25_reload_from_disk_rejects_phantom_1810648(tmp_path):
+    """
+    J25: reload_meta must not ingest a phantom tip rewind into in-memory
+    latest_seq (bypass of read_latest_seq_from_disk high-water).
+    """
+    meta_path = tmp_path / "tick_journal.meta.json"
+    high_water = 1_900_000
+    phantom = 1_810_648
+    with open(meta_path, "w", encoding="utf-8") as handle:
+        json.dump(
+            {"latest_seq": high_water, "seen_trade_ids": {}, "seq_index": [[0, 0]]},
+            handle,
+        )
+    store = TickJournalMetaStore(str(meta_path), dedup_window=10)
+    assert store.read_latest_seq_from_disk() == high_water
+
+    with open(meta_path, "w", encoding="utf-8") as handle:
+        json.dump(
+            {
+                "latest_seq": phantom,
+                "seen_trade_ids": {"BTCUSDT": ["t1"]},
+                "seq_index": [[0, 0], [phantom, 99]],
+            },
+            handle,
+        )
+    store.reload_from_disk()
+    assert store.latest_seq() == high_water
+    assert store.read_latest_seq_from_disk() == high_water
+    # Dedup / seq_index still come from disk (tip alone is clamped).
+    assert store.get_or_create_bucket("BTCUSDT").contains("t1")
+    assert store.seq_index() == [[0, 0], [phantom, 99]]
+
+
+def test_j25_reload_from_disk_clamps_negative_latest_seq_to_zero(tmp_path):
+    """reload_from_disk: negative disk tip is normalized to 0 before high-water clamp."""
+    meta_path = tmp_path / "tick_journal.meta.json"
+    with open(meta_path, "w", encoding="utf-8") as handle:
+        json.dump(
+            {"latest_seq": 0, "seen_trade_ids": {}, "seq_index": [[0, 0]]},
+            handle,
+        )
+    store = TickJournalMetaStore(str(meta_path), dedup_window=10)
+
+    with open(meta_path, "w", encoding="utf-8") as handle:
+        json.dump(
+            {"latest_seq": -5, "seen_trade_ids": {}, "seq_index": [[0, 0]]},
+            handle,
+        )
+    store.reload_from_disk()
+    assert store.latest_seq() == 0
+
+
 def test_meta_store_read_latest_seq_fallback_keeps_disk_high_water(tmp_path, mocker):
     """
     Transient meta I/O must not fall back to a boot-era in-memory tip below the
