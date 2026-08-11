@@ -164,6 +164,50 @@ def test_j25_reload_from_disk_clamps_negative_latest_seq_to_zero(tmp_path):
     assert store.latest_seq() == 0
 
 
+def test_j26_h12_soft_stale_rejects_phantom_tip_1810648(tmp_path):
+    """
+    F-J26-03 / J26 H12 @12:42: soft-stale logged latest_seq=1810648 (phantom)
+    while cursor_seq=1975156 after coherent tips ~1974328 / 1974528.
+
+    Soft-stale diagnostics read tip via read_latest_seq_from_disk (and may
+    reload_meta). After observing the pre-rewind high-water, neither path may
+    surface the phantom tip.
+    """
+    meta_path = tmp_path / "tick_journal.meta.json"
+    # Last coherent soft-stale tip before the H12 phantom (12:28 latest=1974528).
+    high_water = 1_974_528
+    phantom = 1_810_648
+    cursor_seq = 1_975_156  # H12 soft-stale cursor; must stay above tip
+    with open(meta_path, "w", encoding="utf-8") as handle:
+        json.dump(
+            {"latest_seq": high_water, "seen_trade_ids": {}, "seq_index": [[0, 0]]},
+            handle,
+        )
+    store = TickJournalMetaStore(str(meta_path), dedup_window=10)
+    assert store.read_latest_seq_from_disk() == high_water
+    assert cursor_seq > high_water
+
+    with open(meta_path, "w", encoding="utf-8") as handle:
+        json.dump(
+            {
+                "latest_seq": phantom,
+                "seen_trade_ids": {},
+                "seq_index": [[0, 0], [phantom, 42]],
+            },
+            handle,
+        )
+    # Soft-stale tip probe must not echo the rewind fantôme.
+    assert store.read_latest_seq_from_disk() == high_water
+    assert store.read_latest_seq_from_disk() != phantom
+
+    store.reload_from_disk()
+    assert store.latest_seq() == high_water
+    assert store.read_latest_seq_from_disk() == high_water
+    assert store.seq_index() == [[0, 0], [phantom, 42]]
+    # Cursor overhang vs clamped tip remains tip-split sticky, not a rewind.
+    assert cursor_seq > store.latest_seq()
+
+
 def test_meta_store_read_latest_seq_fallback_keeps_disk_high_water(tmp_path, mocker):
     """
     Transient meta I/O must not fall back to a boot-era in-memory tip below the
