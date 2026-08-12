@@ -7,9 +7,9 @@ callback (collector non-zero exit / stop) — once per window, with a min heal
 interval to avoid aggressive storms.
 
 Also covers post-flap reconnect confirms (J22 H20/H21 brief ~1.2–1.3s flaps;
-J27 H19/H20 ~1.25–1.4s with write PASS when journal resumes):
-WS can be UP again with 0 journal writes — ``consume_last_stale_detection``
-exposes that outcome for heal correlation.
+J27 H19/H20 ~1.25–1.4s; J28 H20 arm_count=7 / H21 arm_count=8 with write PASS
+when journal resumes): WS can be UP again with 0 journal writes —
+``consume_last_stale_detection`` exposes that outcome for heal correlation.
 
 False-negative policy: every full confirm arms a window. Never skip
 ``connect_generation=1`` (first boot / post-OS collector respawn).

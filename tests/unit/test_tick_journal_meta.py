@@ -290,6 +290,90 @@ def test_j27_h23_soft_stale_rejects_phantom_tip_1810648(tmp_path):
     assert cursor_seq > store.latest_seq()
 
 
+def test_j28_h03_soft_stale_rejects_phantom_tip_1810648(tmp_path):
+    """
+    F-J28-03 / J28 H03 @03:23:02: soft-stale logged latest_seq=1810648 (phantom)
+    while cursor_seq=2138203 after coherent soft-stale @03:22 tip=2138178.
+
+    v0.18.36 high-water clamp (J25–J27) already closes the report path; this
+    locks the J28 H03 numbers (ABSENT on J28 H02 — ≠ J27 H02) so a future
+    clamp regression fails loudly on the daytime recurrence window.
+    """
+    meta_path = tmp_path / "tick_journal.meta.json"
+    # Soft-stale @03:22:22 coherent tip before the @03:23 fantôme.
+    high_water = 2_138_178
+    phantom = 1_810_648
+    cursor_seq = 2_138_203
+    with open(meta_path, "w", encoding="utf-8") as handle:
+        json.dump(
+            {"latest_seq": high_water, "seen_trade_ids": {}, "seq_index": [[0, 0]]},
+            handle,
+        )
+    store = TickJournalMetaStore(str(meta_path), dedup_window=10)
+    assert store.read_latest_seq_from_disk() == high_water
+    assert cursor_seq > high_water
+
+    with open(meta_path, "w", encoding="utf-8") as handle:
+        json.dump(
+            {
+                "latest_seq": phantom,
+                "seen_trade_ids": {},
+                "seq_index": [[0, 0], [phantom, 3]],
+            },
+            handle,
+        )
+    assert store.read_latest_seq_from_disk() == high_water
+    assert store.read_latest_seq_from_disk() != phantom
+
+    store.reload_from_disk()
+    assert store.latest_seq() == high_water
+    assert store.read_latest_seq_from_disk() == high_water
+    assert store.seq_index() == [[0, 0], [phantom, 3]]
+    assert cursor_seq > store.latest_seq()
+
+
+def test_j28_h22_soft_stale_rejects_phantom_tip_1810648(tmp_path):
+    """
+    F-J28-03 / J28 H22 @22:22:52: soft-stale logged latest_seq=1810648 (phantom)
+    while cursor_seq=2173206 after coherent soft-stale @22:18 tip=2173128;
+    fantôme sticky ×3 (~65s) then catch-up tip=2173228 @22:27.
+
+    Same clamp path as H03; distinct high-water / cursor lock the evening
+    J28 evidence (ABSENT H23 on J28 — ≠ J27 H23).
+    """
+    meta_path = tmp_path / "tick_journal.meta.json"
+    # Soft-stale @22:18:47 coherent tip before the @22:22 fantôme.
+    high_water = 2_173_128
+    phantom = 1_810_648
+    cursor_seq = 2_173_206
+    with open(meta_path, "w", encoding="utf-8") as handle:
+        json.dump(
+            {"latest_seq": high_water, "seen_trade_ids": {}, "seq_index": [[0, 0]]},
+            handle,
+        )
+    store = TickJournalMetaStore(str(meta_path), dedup_window=10)
+    assert store.read_latest_seq_from_disk() == high_water
+    assert cursor_seq > high_water
+
+    with open(meta_path, "w", encoding="utf-8") as handle:
+        json.dump(
+            {
+                "latest_seq": phantom,
+                "seen_trade_ids": {},
+                "seq_index": [[0, 0], [phantom, 22]],
+            },
+            handle,
+        )
+    assert store.read_latest_seq_from_disk() == high_water
+    assert store.read_latest_seq_from_disk() != phantom
+
+    store.reload_from_disk()
+    assert store.latest_seq() == high_water
+    assert store.read_latest_seq_from_disk() == high_water
+    assert store.seq_index() == [[0, 0], [phantom, 22]]
+    assert cursor_seq > store.latest_seq()
+
+
 def test_meta_store_read_latest_seq_fallback_keeps_disk_high_water(tmp_path, mocker):
     """
     Transient meta I/O must not fall back to a boot-era in-memory tip below the

@@ -31,10 +31,11 @@ class TickJournalMetaStore:
         self.__dedup_window = dedup_window
         self.__payload = self.load_payload(self.__meta_path)
         self.__dedup_buckets = self.__hydrate_dedup_buckets()
-        # BB-D23-02 / J25–J27: coherent tip high-water — never report a
+        # BB-D23-02 / J25–J28: coherent tip high-water — never report a
         # phantom rewind below a previously observed durable disk tip
-        # (J24 latest=1790634; J25/J26 H12 + J27 H02/H23 soft-stale sticky
-        # latest=1810648 while cursor ~2.03M / ~2.13M).
+        # (J24 latest=1790634; J25/J26 H12; J27 H02/H23; J28 H03/H07/H09/
+        # H11/H13/H17/H21/H22 soft-stale sticky latest=1810648 while cursor
+        # ~2.13M–~2.17M — ABSENT H02/H23 on J28 ≠ J27).
         self.__disk_tip_high_water = int(self.__payload.get("latest_seq", 0))
 
     @property
@@ -118,9 +119,10 @@ class TickJournalMetaStore:
         Falls back to the coherent high-water (max of in-memory tip and last
         successful disk observation) when disk meta is unreadable.
 
-        BB-D23-02 / J25–J27: rejects phantom tip rewinds below the observed
-        high-water (J24 sticky ``latest=1790634``; J25/J26 H12 + J27 H02
-        cursor~2034155 / H23 cursor~2131704 soft-stale sticky
+        BB-D23-02 / J25–J28: rejects phantom tip rewinds below the observed
+        high-water (J24 sticky ``latest=1790634``; J25/J26 H12; J27 H02
+        cursor~2034155 / H23 cursor~2131704; J28 H03 cursor~2138203 /
+        H13~2158220 / H17~2167213 / H22~2173206 soft-stale sticky
         ``latest=1810648``). High-water advances only on successful disk
         reads — not on unpersisted in-memory ``set_latest_seq`` — so
         META_PERSIST lag stays honest.
@@ -141,11 +143,12 @@ class TickJournalMetaStore:
         """
         Replace in-memory payload and dedup buckets from disk.
 
-        BB-D23-02 / J25–J27: ``latest_seq`` is clamped to the coherent
+        BB-D23-02 / J25–J28: ``latest_seq`` is clamped to the coherent
         high-water so a phantom disk rewind (e.g. ``1810648`` after ~2.03M
-        J27 H02 / ~2.13M H23) cannot poison ``latest_seq()`` / soft-stale
-        diagnostics that bypass ``read_latest_seq_from_disk``. Dedup buckets
-        and seq_index still reload from disk as written.
+        J27 H02 / ~2.13M H23 / J28 H03~2.138M / H22~2.173M) cannot poison
+        ``latest_seq()`` / soft-stale diagnostics that bypass
+        ``read_latest_seq_from_disk``. Dedup buckets and seq_index still
+        reload from disk as written.
         """
         self.__payload = self.load_payload(self.__meta_path)
         self.__dedup_buckets = self.__hydrate_dedup_buckets()

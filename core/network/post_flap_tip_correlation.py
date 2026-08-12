@@ -7,9 +7,11 @@ does not advance in the observation window, emits ``post_flap_tip_stale`` at
 CRITICAL and invokes ``on_stale`` so the collector can fail-fast (non-zero exit).
 
 Covers brief public flaps (J22 H20 ~1.24s / H21 ~1.3s; J27 H19 ~1.38s /
-H20 ~1.25s): WS reconnects quickly but tip may stay mute (historical WS-UP /
-0-write). Healthy J27 path: tip frozen only during the flap hole, then tip /
-journal writes resume within grace → correlation INFO only, no tip-stale heal.
+H20 ~1.25s; J28 H20/H21 ~1.25s): WS reconnects quickly but tip may stay mute
+(historical WS-UP / 0-write). Healthy J27/J28 path: tip frozen only during the
+flap hole, then tip / journal writes resume within grace → correlation INFO
+only, no tip-stale heal. J28 H19 private-only ~374 ms flap is out of scope here
+(public collector flap ABSENT that hour).
 Public detection APIs expose awaiting state and consumable stale results for
 heal correlation.
 
