@@ -6,7 +6,8 @@ configurable window. Otherwise emit a clear CRITICAL and invoke a self-heal
 callback (collector non-zero exit / stop) — once per window, with a min heal
 interval to avoid aggressive storms.
 
-Also covers post-flap reconnect confirms (J22 H20/H21 brief ~1.2–1.3s flaps):
+Also covers post-flap reconnect confirms (J22 H20/H21 brief ~1.2–1.3s flaps;
+J27 H19/H20 ~1.25–1.4s with write PASS when journal resumes):
 WS can be UP again with 0 journal writes — ``consume_last_stale_detection``
 exposes that outcome for heal correlation.
 

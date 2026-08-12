@@ -51,6 +51,34 @@ def is_eof_caught_up_progress_snapshot(snapshot: dict) -> bool:
     return read_offset >= journal_size and lag_seq == 0 and not incomplete_stuck
 
 
+def is_seq_caught_up_trailing_byte_lag_snapshot(snapshot: dict) -> bool:
+    """
+    Return True for J27 H07 false-positive soft-stale resync signature.
+
+    Evidence H07 @07:54:20: ``offset < size``, ``next_seq > latest_seq``,
+    ``lag_seq=1`` (artificial bump from unread bytes), ``incomplete_stuck=False``.
+    Seq cursor is caught up; trailing bytes are a mid-append / not-yet-polled tip.
+    Force-rebind here abandons an in-flight write and WARN-spams without healing
+    real seq lag — tail-follow poll owns the incomplete-wait window instead.
+    """
+    try:
+        read_offset = int(snapshot["read_offset"])
+        journal_size = int(snapshot["journal_size"])
+        next_seq = int(snapshot["next_seq"])
+        latest_seq = int(snapshot["latest_seq"])
+        incomplete_stuck = bool(snapshot["incomplete_stuck"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(
+            "progress snapshot must expose read_offset, journal_size, "
+            f"next_seq, latest_seq, incomplete_stuck as numeric/bool fields: {exc}"
+        ) from exc
+    return (
+        not incomplete_stuck
+        and read_offset < journal_size
+        and next_seq > latest_seq
+    )
+
+
 def _validate_symbol(symbol: str, param_name: str = "symbol") -> None:
     if symbol is None:
         raise ValueError(f"{param_name} cannot be empty")
@@ -172,13 +200,19 @@ class JournalTickStream(IExchangeStream):
         Force incremental-reader rebind when progress shows unread lag (D7).
 
         Idle EOF wait (``is_eof_caught_up_progress_snapshot``) is a no-op.
-        Real unread lag / incomplete tip triggers index reload + ``force_rebind``.
+        Seq-caught-up trailing bytes without incomplete wait
+        (``is_seq_caught_up_trailing_byte_lag_snapshot``, J27 H07) are also a
+        no-op — avoid mid-append false-positive rebind / WARN spam.
+        Real seq lag / sticky incomplete tip triggers index reload + ``force_rebind``.
 
         Returns:
-            True when a resync was performed, False when already caught up at EOF.
+            True when a resync was performed, False when no-op (EOF caught up
+            or H07 trailing-byte false positive).
         """
         snapshot = self.__incremental_reader.get_read_progress_snapshot()
         if is_eof_caught_up_progress_snapshot(snapshot):
+            return False
+        if is_seq_caught_up_trailing_byte_lag_snapshot(snapshot):
             return False
         self.__journal.reload_seq_index_from_disk()
         self.__incremental_reader.force_rebind_from_seq(self.__next_seq)

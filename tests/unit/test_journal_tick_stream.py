@@ -13,6 +13,7 @@ from core.journal.journal_tick_stream import (
     JournalStreamFatalError,
     JournalTickStream,
     is_eof_caught_up_progress_snapshot,
+    is_seq_caught_up_trailing_byte_lag_snapshot,
 )
 
 
@@ -254,6 +255,51 @@ def test_is_eof_caught_up_progress_snapshot_rejects_invalid_payload():
                 "incomplete_stuck": False,
             }
         )
+
+
+def test_is_seq_caught_up_trailing_byte_lag_snapshot_j27_h07_contract():
+    """J27 H07: exact forced-resync false-positive fields must be recognized."""
+    h07 = {
+        "read_offset": 254_937_853,
+        "journal_size": 254_938_264,
+        "next_seq": 2_063_837,
+        "latest_seq": 2_063_836,
+        "lag_seq": 1,
+        "incomplete_stuck": False,
+    }
+    assert is_seq_caught_up_trailing_byte_lag_snapshot(h07) is True
+    assert is_eof_caught_up_progress_snapshot(h07) is False
+
+    # Real seq lag (tip at/ahead of next) is not the H07 false positive.
+    assert (
+        is_seq_caught_up_trailing_byte_lag_snapshot(
+            {
+                "read_offset": 50,
+                "journal_size": 100,
+                "next_seq": 10,
+                "latest_seq": 12,
+                "lag_seq": 3,
+                "incomplete_stuck": False,
+            }
+        )
+        is False
+    )
+    # Sticky incomplete still needs force-resync path (not the H07 no-op).
+    assert (
+        is_seq_caught_up_trailing_byte_lag_snapshot(
+            {
+                "read_offset": 50,
+                "journal_size": 100,
+                "next_seq": 10,
+                "latest_seq": 9,
+                "lag_seq": 1,
+                "incomplete_stuck": True,
+            }
+        )
+        is False
+    )
+    with pytest.raises(ValueError, match="progress snapshot must expose"):
+        is_seq_caught_up_trailing_byte_lag_snapshot({"read_offset": 0})
 
 
 @pytest.mark.asyncio

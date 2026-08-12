@@ -984,6 +984,115 @@ async def test_j21_h20_flap_confirm_tip_stagnant_triggers_dual_heal(
 
 
 @pytest.mark.asyncio
+async def test_j27_h19_h20_brief_flap_tip_advances_write_liveness_pass(
+    mocker, mock_ws_manager, mock_parser, caplog, tmp_path
+):
+    """J27 H19/H20 healthy public flap: brief reconnect + tip resume + write PASS.
+
+    Chronology (beta 2026-08-07 H19 ~1.38s / H20 ~1.25s):
+      opaque WS close → reconnect → sub XRPUSDT confirmed → write-liveness armed
+      → tip advances / journal write within grace. Must NOT dual-heal (contrast
+      J21 tip-freeze). Write-liveness must remain armed on post-flap confirm.
+    """
+    import logging
+
+    from core.journal.journal_dispatch_decorator import JournalDispatchDecorator
+    from core.journal.tick_journal import TickJournal
+    from core.routing.sink_dispatch_strategy import SinkDispatchStrategy
+    from core.state.post_reconnect_write_liveness import PostReconnectWriteLivenessGuard
+
+    tip = {"seq": 2_122_240}  # J27 H19 tip at flap
+    write_stale: list[object] = []
+    flap_stale: list[object] = []
+
+    guard = PostReconnectWriteLivenessGuard(
+        timeout_seconds=0.12,
+        min_heal_interval_seconds=0.0,
+        on_stale=lambda *_: write_stale.append(True),
+    )
+    journal = TickJournal(str(tmp_path))
+    dispatch = JournalDispatchDecorator(
+        SinkDispatchStrategy(),
+        journal,
+        write_liveness_guard=guard,
+    )
+
+    captured, original = _capture_on_connect_callback(mock_ws_manager)
+    stream = BitgetTickStream(
+        network_manager=mock_ws_manager,
+        subscription_strategy=BitgetSubscriptionProtocol(inst_type="mc"),
+        parsing_strategy=mock_parser,
+        dispatch_strategy=dispatch,
+        symbols=["XRPUSDT"],
+        confirmation_timeout_seconds=1.0,
+        write_liveness_guard=guard,
+    )
+    mock_ws_manager.set_on_connect_callback = original
+    mock_ws_manager.set_tip_seq_provider(lambda: tip["seq"])
+    mock_ws_manager.set_on_post_flap_tip_stale(
+        lambda *_: flap_stale.append(True)
+    )
+    mock_ws_manager.flap_tip_monitor.set_stale_window_seconds(0.12)
+    mock_ws_manager.flap_tip_monitor.set_min_heal_interval_seconds(0.0)
+
+    mocker.patch(
+        "core.network.reconnecting_ws_manager.ReconnectingWebSocketManager.send",
+        new_callable=AsyncMock,
+    )
+
+    # Long-lived collector: boot confirm satisfied (mirrors gen before H19 flap).
+    await captured[0]()
+    assert stream.connect_generation == 1
+    guard.arm_after_subscriptions_confirmed({"XRPUSDT"}, connect_generation=1)
+    guard.record_journal_write()
+
+    async def mock_listen():
+        yield orjson_subscribe_ack("XRPUSDT")
+        # Satisfy write-liveness via journal write (post-flap recovery).
+        guard.record_journal_write()
+        tip["seq"] = 2_123_328
+        assert mock_ws_manager.flap_tip_monitor.record_tip_progress() is True
+        await asyncio.sleep(0.18)
+
+    mocker.patch.object(
+        stream.network_manager,
+        "start_connection_and_listen",
+        side_effect=mock_listen,
+    )
+
+    with caplog.at_level(logging.INFO):
+        mock_ws_manager.flap_tip_monitor.note_connection_closed(
+            close_wall_ms=19_19_36_876, close_mono_ms=100
+        )
+        mock_ws_manager.flap_tip_monitor.note_connection_restored(
+            reconnect_wall_ms=19_19_38_257, reconnect_mono_ms=1_484
+        )
+        await captured[0]()
+        assert stream.connect_generation == 2
+        await stream.start_streaming()
+
+    assert write_stale == []
+    assert flap_stale == []
+    assert any(
+        "post_flap_correlation" in r.message
+        and "brief_public_flap=True" in r.message
+        and "since_close_ms=1384" in r.message
+        and "tip_seq_before=2122240" in r.message
+        for r in caplog.records
+    )
+    assert any(
+        "Post-confirm write-liveness armée" in r.message
+        and "first_boot=False" in r.message
+        for r in caplog.records
+    )
+    assert not any("post_flap_tip_stale" in r.message for r in caplog.records)
+    assert not any(
+        "write-liveness FAILED" in r.message for r in caplog.records
+    )
+    assert stream.write_liveness_guard is guard
+
+
+@pytest.mark.asyncio
 async def test_first_boot_confirm_arms_write_liveness_mute_tip_heal(
     mocker, mock_ws_manager, mock_parser, caplog
 ):

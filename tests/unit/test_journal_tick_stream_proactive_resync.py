@@ -15,7 +15,10 @@ import pytest
 
 from core.journal.journal_incremental_reader import JournalIncrementalReader
 from core.journal.journal_io import atomic_write_json
-from core.journal.journal_tick_stream import JournalTickStream
+from core.journal.journal_tick_stream import (
+    JournalTickStream,
+    is_seq_caught_up_trailing_byte_lag_snapshot,
+)
 from core.journal.tick_journal import TickJournal
 from core.journal.tick_journal_codec import tick_to_dict
 from core.journal.tick_journal_cursor import TickJournalCursor
@@ -74,6 +77,55 @@ def test_force_tail_resync_if_unread_returns_false_when_eof_caught_up(tmp_path):
     stream = JournalTickStream(journal, poll_interval_seconds=0.01)
     stream.set_cursor(TickJournalCursor(last_processed_seq=1))
     assert stream.force_tail_resync_if_unread() is False
+
+
+def test_force_tail_resync_skips_j27_h07_seq_caught_up_trailing_bytes(tmp_path, caplog):
+    """
+    REGRESSION J27 H07 @07:54:20 — soft-stale journal_lag lag_seq=1 with
+    offset<size, next_seq>latest_seq, incomplete_stuck=False must NOT force
+    tail resync (false-positive mid-append / not-yet-polled trailing bytes).
+    """
+    journal = TickJournal(str(tmp_path))
+    journal.append(_tick("t1"))
+    journal.flush_meta()
+    stream = JournalTickStream(journal, poll_interval_seconds=0.01)
+    stream.set_cursor(TickJournalCursor(last_processed_seq=1))
+
+    # Trailing mid-append before the next poll — H07 race shape.
+    with open(journal.journal_path, "a", encoding="utf-8") as handle:
+        handle.write(_record_line(2, "inflight")[:40])
+
+    snap = stream.get_read_progress_snapshot()
+    assert snap["read_offset"] < snap["journal_size"]
+    assert snap["next_seq"] > snap["latest_seq"]
+    assert snap["lag_seq"] == 1
+    assert snap["incomplete_stuck"] is False
+    assert is_seq_caught_up_trailing_byte_lag_snapshot(snap) is True
+
+    with caplog.at_level(logging.WARNING):
+        assert stream.force_tail_resync_if_unread() is False
+    assert not any("forced tail resync" in r.message.lower() for r in caplog.records)
+
+
+def test_force_tail_resync_if_unread_when_meta_tip_ahead(tmp_path, caplog):
+    """Real seq lag (latest_seq >= next_seq) still force-resyncs (≠ H07 FP)."""
+    journal = TickJournal(str(tmp_path))
+    journal.append(_tick("t1"))
+    journal.flush_meta()
+    stream = JournalTickStream(journal, poll_interval_seconds=0.01)
+    stream.set_cursor(TickJournalCursor(last_processed_seq=1))
+    journal.append(_tick("t2", ts=2000))
+    journal.flush_meta()
+
+    snap = stream.get_read_progress_snapshot()
+    assert snap["latest_seq"] >= snap["next_seq"]
+    assert snap["lag_seq"] >= 1
+    assert snap["incomplete_stuck"] is False
+    assert is_seq_caught_up_trailing_byte_lag_snapshot(snap) is False
+
+    with caplog.at_level(logging.WARNING):
+        assert stream.force_tail_resync_if_unread() is True
+    assert any("forced tail resync" in r.message.lower() for r in caplog.records)
 
 
 def test_force_tail_resync_if_unread_clears_incomplete_tip_and_reads_next(

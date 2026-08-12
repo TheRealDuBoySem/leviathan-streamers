@@ -31,10 +31,10 @@ class TickJournalMetaStore:
         self.__dedup_window = dedup_window
         self.__payload = self.load_payload(self.__meta_path)
         self.__dedup_buckets = self.__hydrate_dedup_buckets()
-        # BB-D23-02 / J25–J26: coherent tip high-water — never report a
+        # BB-D23-02 / J25–J27: coherent tip high-water — never report a
         # phantom rewind below a previously observed durable disk tip
-        # (J24 latest=1790634; J25/J26 H12 soft-stale sticky latest=1810648
-        # while cursor ~1975156).
+        # (J24 latest=1790634; J25/J26 H12 + J27 H02/H23 soft-stale sticky
+        # latest=1810648 while cursor ~2.03M / ~2.13M).
         self.__disk_tip_high_water = int(self.__payload.get("latest_seq", 0))
 
     @property
@@ -118,12 +118,12 @@ class TickJournalMetaStore:
         Falls back to the coherent high-water (max of in-memory tip and last
         successful disk observation) when disk meta is unreadable.
 
-        BB-D23-02 / J25–J26: rejects phantom tip rewinds below the observed
-        high-water (J24 sticky ``latest=1790634``; J25/J26 H12 soft-stale
-        sticky ``latest=1810648`` while cursor ~1975156 / prior tip ~1.97M).
-        High-water advances only on successful disk reads — not on
-        unpersisted in-memory ``set_latest_seq`` — so META_PERSIST lag
-        stays honest.
+        BB-D23-02 / J25–J27: rejects phantom tip rewinds below the observed
+        high-water (J24 sticky ``latest=1790634``; J25/J26 H12 + J27 H02
+        cursor~2034155 / H23 cursor~2131704 soft-stale sticky
+        ``latest=1810648``). High-water advances only on successful disk
+        reads — not on unpersisted in-memory ``set_latest_seq`` — so
+        META_PERSIST lag stays honest.
         """
         try:
             meta = self.load_payload(self.__meta_path)
@@ -141,9 +141,9 @@ class TickJournalMetaStore:
         """
         Replace in-memory payload and dedup buckets from disk.
 
-        BB-D23-02 / J25–J26: ``latest_seq`` is clamped to the coherent
-        high-water so a phantom disk rewind (e.g. ``1810648`` after ~1.97M,
-        J26 H12 soft-stale) cannot poison ``latest_seq()`` / soft-stale
+        BB-D23-02 / J25–J27: ``latest_seq`` is clamped to the coherent
+        high-water so a phantom disk rewind (e.g. ``1810648`` after ~2.03M
+        J27 H02 / ~2.13M H23) cannot poison ``latest_seq()`` / soft-stale
         diagnostics that bypass ``read_latest_seq_from_disk``. Dedup buckets
         and seq_index still reload from disk as written.
         """

@@ -328,3 +328,66 @@ async def test_j22_style_post_flap_confirm_with_write_clears_without_detection()
     await asyncio.sleep(0.12)
     assert stale_calls == []
     assert guard.consume_last_stale_detection() is None
+
+
+@pytest.mark.asyncio
+async def test_j27_h19_h20_post_flap_write_liveness_pass_at_high_connect_generation(
+    caplog,
+):
+    """J27 H19/H20: write-liveness armed after brief public flap, then PASS.
+
+    Live: H19 arm_count=5 connect_generation=5; H20 arm_count=6 connect_generation=6;
+    first_boot=False; journal writes resume well before 45s — 0 FAIL.
+    Must not cancel/skip re-arm on high connect_generation (no race with flap).
+    """
+    import logging
+
+    stale_calls: list[object] = []
+    guard = PostReconnectWriteLivenessGuard(
+        timeout_seconds=0.08,
+        min_heal_interval_seconds=0.0,
+        on_stale=lambda *_: stale_calls.append(True),
+    )
+
+    # Prior arms (boot + earlier flaps) so arm_count mirrors long-lived collector.
+    for gen in range(1, 5):
+        guard.arm_after_subscriptions_confirmed({"XRPUSDT"}, connect_generation=gen)
+        guard.record_journal_write()
+    assert guard.arm_count == 4
+    assert guard.is_awaiting_write() is False
+
+    with caplog.at_level(logging.INFO):
+        # H19-style post-flap confirm (connect_generation=5).
+        guard.arm_after_subscriptions_confirmed({"XRPUSDT"}, connect_generation=5)
+        assert guard.arm_count == 5
+        assert guard.is_awaiting_write() is True
+        assert any(
+            "Post-confirm write-liveness armée" in r.message
+            and "arm_count=5" in r.message
+            and "connect_generation=5" in r.message
+            and "first_boot=False" in r.message
+            for r in caplog.records
+        )
+        guard.record_journal_write()
+        assert guard.is_awaiting_write() is False
+
+        # H20-style subsequent flap (connect_generation=6) — cancel prior, re-arm.
+        guard.cancel()  # mirrors base_stream.__handle_connect on reconnect
+        guard.arm_after_subscriptions_confirmed({"XRPUSDT"}, connect_generation=6)
+        assert guard.arm_count == 6
+        assert any(
+            "arm_count=6" in r.message
+            and "connect_generation=6" in r.message
+            and "first_boot=False" in r.message
+            for r in caplog.records
+        )
+        guard.record_journal_write()
+
+    await asyncio.sleep(0.12)
+    assert stale_calls == []
+    assert guard.consume_last_stale_detection() is None
+    assert not any(
+        "write-liveness FAILED" in r.message.lower()
+        or "write-liveness stale" in r.message.lower()
+        for r in caplog.records
+    )

@@ -6,9 +6,12 @@ module correlates public WS flaps with journal tip progress and, when the tip
 does not advance in the observation window, emits ``post_flap_tip_stale`` at
 CRITICAL and invokes ``on_stale`` so the collector can fail-fast (non-zero exit).
 
-Covers brief public flaps (J22 H20 ~1.24s / H21 ~1.3s): WS reconnects quickly
-but tip may stay mute (historical WS-UP / 0-write). Public detection APIs
-expose awaiting state and consumable stale results for heal correlation.
+Covers brief public flaps (J22 H20 ~1.24s / H21 ~1.3s; J27 H19 ~1.38s /
+H20 ~1.25s): WS reconnects quickly but tip may stay mute (historical WS-UP /
+0-write). Healthy J27 path: tip frozen only during the flap hole, then tip /
+journal writes resume within grace → correlation INFO only, no tip-stale heal.
+Public detection APIs expose awaiting state and consumable stale results for
+heal correlation.
 
 Wiring note (gap, intentional under BB-B5-A1 scope): ``record_tip_progress`` is
 a public early-satisfy hook; collectors may call it from the journal write path.
