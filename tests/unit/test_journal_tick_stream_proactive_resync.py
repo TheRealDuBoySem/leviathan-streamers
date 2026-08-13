@@ -107,6 +107,47 @@ def test_force_tail_resync_skips_j27_h07_seq_caught_up_trailing_bytes(tmp_path, 
     assert not any("forced tail resync" in r.message.lower() for r in caplog.records)
 
 
+# Exact H11 @11:36:30 fields from leviathan_2026-08-11_11.log (runtime v0.18.35).
+_J31_H11_TRAILING_BYTE_SNAPSHOT = {
+    "read_offset": 293_973_475,
+    "journal_size": 293_973_613,
+    "next_seq": 2_347_069,
+    "latest_seq": 2_347_068,
+    "lag_seq": 1,
+    "incomplete_stuck": False,
+}
+
+
+def test_force_tail_resync_skips_j31_h11_exact_log_snapshot(
+    tmp_path, caplog, monkeypatch
+):
+    """
+    REGRESSION J31 F-J31-08 / H11 @11:36:30 — soft-stale journal_lag +
+    ``JournalTickStream forced tail resync`` under v0.18.35 with
+    offset=293973475 < size=293973613, next_seq=2347069 > latest_seq=2347068,
+    lag_seq=1, incomplete_stuck=False must NO-OP (J27 H07 gate in v0.18.36+).
+    WATCH mitigation lock — recovery was healthy; spam FP must stay closed.
+    """
+    journal = TickJournal(str(tmp_path))
+    journal.append(_tick("t1"))
+    journal.flush_meta()
+    stream = JournalTickStream(journal, poll_interval_seconds=0.01)
+
+    monkeypatch.setattr(
+        JournalIncrementalReader,
+        "get_read_progress_snapshot",
+        lambda self: dict(_J31_H11_TRAILING_BYTE_SNAPSHOT),
+    )
+
+    snap = stream.get_read_progress_snapshot()
+    assert snap == _J31_H11_TRAILING_BYTE_SNAPSHOT
+    assert is_seq_caught_up_trailing_byte_lag_snapshot(snap) is True
+
+    with caplog.at_level(logging.WARNING):
+        assert stream.force_tail_resync_if_unread() is False
+    assert not any("forced tail resync" in r.message.lower() for r in caplog.records)
+
+
 def test_force_tail_resync_if_unread_when_meta_tip_ahead(tmp_path, caplog):
     """Real seq lag (latest_seq >= next_seq) still force-resyncs (≠ H07 FP)."""
     journal = TickJournal(str(tmp_path))

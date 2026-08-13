@@ -302,6 +302,23 @@ def test_is_seq_caught_up_trailing_byte_lag_snapshot_j27_h07_contract():
         is_seq_caught_up_trailing_byte_lag_snapshot({"read_offset": 0})
 
 
+def test_is_seq_caught_up_trailing_byte_lag_snapshot_j31_h11_contract():
+    """
+    REGRESSION J31 F-J31-08 / H11 @11:36:30 — exact forced-resync log fields
+    (v0.18.35 before J27 gate in v0.18.36) must stay recognized as trailing-byte FP.
+    """
+    h11 = {
+        "read_offset": 293_973_475,
+        "journal_size": 293_973_613,
+        "next_seq": 2_347_069,
+        "latest_seq": 2_347_068,
+        "lag_seq": 1,
+        "incomplete_stuck": False,
+    }
+    assert is_seq_caught_up_trailing_byte_lag_snapshot(h11) is True
+    assert is_eof_caught_up_progress_snapshot(h11) is False
+
+
 @pytest.mark.asyncio
 async def test_d6_eof_caught_up_snapshot_logs_debug_never_warning(
     tmp_path, caplog, monkeypatch

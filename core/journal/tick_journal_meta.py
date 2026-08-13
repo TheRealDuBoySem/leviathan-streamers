@@ -31,14 +31,16 @@ class TickJournalMetaStore:
         self.__dedup_window = dedup_window
         self.__payload = self.load_payload(self.__meta_path)
         self.__dedup_buckets = self.__hydrate_dedup_buckets()
-        # BB-D23-02 / J25–J30: coherent tip high-water — never report a
+        # BB-D23-02 / J25–J31: coherent tip high-water — never report a
         # phantom rewind below a previously observed durable disk tip
         # (J24 latest=1790634; J25/J26 H12; J27 H02/H23; J28 H03/H07/H09/
         # H11/H13/H17/H21/H22 soft-stale sticky latest=1810648 while cursor
         # ~2.13M–~2.17M — ABSENT H02/H23 on J28 ≠ J27; J29 H02 ×3 same
         # 1810648 + post-respawn sticky 2182116 = H03 heal tip baseline,
         # multi-h H04/H08/H10–11/H13–14/H16/H19/H23; J30 same 2182116
-        # @H02/H06/H19–H21/H23A while 1810648 ABSENT day-wide).
+        # @H02/H06/H19–H21/H23A while 1810648 ABSENT day-wide; J31 sticky
+        # Forced to_seq=2319820 H04–H23 under v0.18.35 — clamp still applies;
+        # force_rewind must also receive coherent tip_seq).
         self.__disk_tip_high_water = int(self.__payload.get("latest_seq", 0))
 
     @property
@@ -122,7 +124,7 @@ class TickJournalMetaStore:
         Falls back to the coherent high-water (max of in-memory tip and last
         successful disk observation) when disk meta is unreadable.
 
-        BB-D23-02 / J25–J30: rejects phantom tip rewinds below the observed
+        BB-D23-02 / J25–J31: rejects phantom tip rewinds below the observed
         high-water (J24 sticky ``latest=1790634``; J25/J26 H12; J27 H02
         cursor~2034155 / H23 cursor~2131704; J28 H03 cursor~2138203 /
         H13~2158220 / H17~2167213 / H22~2173206 soft-stale sticky
@@ -130,9 +132,10 @@ class TickJournalMetaStore:
         J29 post-heal sticky ``2182116`` H04 cursor~2182642 /
         H23~2216660; J30 same ``2182116`` H02 cursor~2238113 /
         H06~2249611 / H19~2297597 / H20~2298589 / H21~2300067 /
-        H23A~2313486 — ``1810648`` ABSENT). High-water advances only
-        on successful disk reads — not on unpersisted in-memory
-        ``set_latest_seq`` — so META_PERSIST lag stays honest.
+        H23A~2313486 — ``1810648`` ABSENT; J31 sticky ``2319820`` while
+        live ~2.32M–2.38M). High-water advances only on successful disk
+        reads — not on unpersisted in-memory ``set_latest_seq`` — so
+        META_PERSIST lag stays honest.
         """
         try:
             meta = self.load_payload(self.__meta_path)
@@ -150,14 +153,15 @@ class TickJournalMetaStore:
         """
         Replace in-memory payload and dedup buckets from disk.
 
-        BB-D23-02 / J25–J30: ``latest_seq`` is clamped to the coherent
+        BB-D23-02 / J25–J31: ``latest_seq`` is clamped to the coherent
         high-water so a phantom disk rewind (e.g. ``1810648`` after ~2.03M
         J27 H02 / ~2.13M H23 / J28 H03~2.138M / H22~2.173M / J29 H02
         ~2.179M; or post-respawn ``2182116`` after J29 H04~2.182M /
         H23~2.216M / J30 H02~2.238M / H06~2.249M / H19–H21~2.297M–
-        2.300M / H23A~2.313M) cannot poison ``latest_seq()`` /
-        soft-stale diagnostics that bypass ``read_latest_seq_from_disk``.
-        Dedup buckets and seq_index still reload from disk as written.
+        2.300M / H23A~2.313M; or J31 sticky ``2319820`` after H04~2.321M /
+        H15~2.371M) cannot poison ``latest_seq()`` / soft-stale
+        diagnostics that bypass ``read_latest_seq_from_disk``. Dedup
+        buckets and seq_index still reload from disk as written.
         """
         self.__payload = self.load_payload(self.__meta_path)
         self.__dedup_buckets = self.__hydrate_dedup_buckets()

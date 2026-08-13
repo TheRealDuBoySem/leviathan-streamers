@@ -752,6 +752,82 @@ def test_j30_h23a_soft_stale_rejects_phantom_tip_2182116(tmp_path):
     assert cursor_seq > store.latest_seq()
 
 
+def test_j31_h15_soft_stale_rejects_phantom_tip_2319820(tmp_path):
+    """
+    F-J31-01 / J31 H15: Forced rewind sticky ``to_seq=2319820`` while live
+    cursor ~2371k–2379k (pic ×7 under v0.18.35). Same high-water clamp class
+    as ``1810648`` / ``2182116`` — lock the J31 sticky seq so a clamp
+    regression fails loudly. Early J30 H23B tip-aligned window is invalidé.
+    """
+    meta_path = tmp_path / "tick_journal.meta.json"
+    high_water = 2_371_720
+    phantom = 2_319_820
+    cursor_seq = 2_371_814  # ahead≈94 vs coherent tip (H15 band)
+    with open(meta_path, "w", encoding="utf-8") as handle:
+        json.dump(
+            {"latest_seq": high_water, "seen_trade_ids": {}, "seq_index": [[0, 0]]},
+            handle,
+        )
+    store = TickJournalMetaStore(str(meta_path), dedup_window=10)
+    assert store.read_latest_seq_from_disk() == high_water
+    assert cursor_seq > high_water
+    assert high_water > phantom
+
+    with open(meta_path, "w", encoding="utf-8") as handle:
+        json.dump(
+            {
+                "latest_seq": phantom,
+                "seen_trade_ids": {},
+                "seq_index": [[0, 0], [phantom, 15]],
+            },
+            handle,
+        )
+    assert store.read_latest_seq_from_disk() == high_water
+    assert store.read_latest_seq_from_disk() != phantom
+
+    store.reload_from_disk()
+    assert store.latest_seq() == high_water
+    assert store.read_latest_seq_from_disk() == high_water
+    assert store.seq_index() == [[0, 0], [phantom, 15]]
+    assert cursor_seq > store.latest_seq()
+
+
+def test_j31_h04_soft_stale_rejects_phantom_tip_2319820(tmp_path):
+    """
+    F-J31-01 / J31 H04: Forced rewind sticky ``2319820`` while live tip
+    ~2321k–2322k (×3 clusters under v0.18.35). Distinct early-day lock from H15.
+    """
+    meta_path = tmp_path / "tick_journal.meta.json"
+    high_water = 2_321_720
+    phantom = 2_319_820
+    cursor_seq = 2_321_790
+    with open(meta_path, "w", encoding="utf-8") as handle:
+        json.dump(
+            {"latest_seq": high_water, "seen_trade_ids": {}, "seq_index": [[0, 0]]},
+            handle,
+        )
+    store = TickJournalMetaStore(str(meta_path), dedup_window=10)
+    assert store.read_latest_seq_from_disk() == high_water
+    assert cursor_seq > high_water
+
+    with open(meta_path, "w", encoding="utf-8") as handle:
+        json.dump(
+            {
+                "latest_seq": phantom,
+                "seen_trade_ids": {},
+                "seq_index": [[0, 0], [phantom, 4]],
+            },
+            handle,
+        )
+    assert store.read_latest_seq_from_disk() == high_water
+    assert store.read_latest_seq_from_disk() != phantom
+
+    store.reload_from_disk()
+    assert store.latest_seq() == high_water
+    assert store.read_latest_seq_from_disk() == high_water
+    assert store.seq_index() == [[0, 0], [phantom, 4]]
+
+
 def test_meta_store_read_latest_seq_fallback_keeps_disk_high_water(tmp_path, mocker):
     """
     Transient meta I/O must not fall back to a boot-era in-memory tip below the
