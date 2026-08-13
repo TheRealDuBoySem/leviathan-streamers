@@ -153,6 +153,20 @@ class TickJournal:
         """
         return self.__meta_store.read_latest_seq_from_disk()
 
+    def ensure_latest_seq_at_least(self, seq: int) -> bool:
+        """
+        Repair sticky disk tip fantômes by advancing meta tip + persist (J32).
+
+        Returns:
+            True when the durable tip was advanced, else False.
+        """
+        with JournalFileLock(self.__lock_path):
+            with self.__thread_lock:
+                advanced = self.__meta_store.ensure_latest_seq_at_least(seq)
+                if advanced:
+                    self.__meta_store.persist()
+                return advanced
+
     def load_cursor(self) -> TickJournalCursor:
         if not os.path.exists(self.__cursor_path):
             return TickJournalCursor()

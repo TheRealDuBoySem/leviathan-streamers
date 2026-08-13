@@ -104,6 +104,55 @@ def test_journal_tick_stream_mark_without_pending_raises(tmp_path):
         stream.mark_tick_as_processed()
 
 
+@pytest.mark.asyncio
+async def test_journal_tick_stream_set_cursor_clears_pending_mid_consume(tmp_path):
+    """
+    REGRESSION J32 / BB-D32-01: set_cursor (tip-split rewind) while a tick is
+    pending must clear pending_seq, release the queue slot, and make the
+    subsequent mark_tick a no-op (engine finally must not crash).
+    """
+    journal = TickJournal(str(tmp_path))
+    journal.append(_tick("t1"))
+    stream = JournalTickStream(journal, poll_interval_seconds=0.01, symbols=["BTCUSDT"])
+    stream_task = await _run_stream(stream)
+
+    tick = await stream.wait_for_next_tick()
+    assert tick.trade_id == "t1"
+    assert stream.has_pending_tick() is True
+    stream.set_cursor(TickJournalCursor(last_processed_seq=0))
+    assert stream.has_pending_tick() is False
+    # No-op after intentional invalidation (not a bare misuse of mark).
+    stream.mark_tick_as_processed()
+    assert stream.has_pending_tick() is False
+
+    await _stop_stream(stream, stream_task)
+
+
+@pytest.mark.asyncio
+async def test_journal_tick_stream_set_cursor_tolerates_task_done_without_join(
+    tmp_path,
+):
+    """
+    J32 BB-D32-01: if the queue join counter was already released before
+    set_cursor, task_done ValueError must be swallowed (no crash mid-rewind).
+    """
+    journal = TickJournal(str(tmp_path))
+    journal.append(_tick("t1"))
+    stream = JournalTickStream(journal, poll_interval_seconds=0.01, symbols=["BTCUSDT"])
+    stream_task = await _run_stream(stream)
+
+    tick = await stream.wait_for_next_tick()
+    assert tick.trade_id == "t1"
+    assert stream.has_pending_tick() is True
+    # Premature task_done → unfinished counter already balanced.
+    stream._JournalTickStream__queue.task_done()
+    stream.set_cursor(TickJournalCursor(last_processed_seq=0))
+    assert stream.has_pending_tick() is False
+    stream.mark_tick_as_processed()
+
+    await _stop_stream(stream, stream_task)
+
+
 def test_journal_tick_stream_attach_observer_validates_type(tmp_path):
     stream = JournalTickStream(TickJournal(str(tmp_path)))
     with pytest.raises(TypeError, match="IPriceObserver"):
@@ -151,7 +200,12 @@ def test_journal_tick_stream_get_read_progress_snapshot_delegates(tmp_path):
 
 def _is_empty_poll_diagnostic(record) -> bool:
     msg = record.message.lower()
-    return "journal unread lag" in msg or "waiting for new journal" in msg or "caught up at eof" in msg
+    return (
+        "journal unread lag" in msg
+        or "waiting for new journal" in msg
+        or "caught up at eof" in msg
+        or "trailing journal bytes" in msg
+    )
 
 
 class _FakeClock:
@@ -317,6 +371,87 @@ def test_is_seq_caught_up_trailing_byte_lag_snapshot_j31_h11_contract():
     }
     assert is_seq_caught_up_trailing_byte_lag_snapshot(h11) is True
     assert is_eof_caught_up_progress_snapshot(h11) is False
+
+
+def test_is_seq_caught_up_trailing_byte_lag_snapshot_j32_h01_h02_contract():
+    """
+    REGRESSION J32 F-J32-06 / H01–H02 — soft-stale journal_lag + forced tail
+    resync under v0.18.35 with next_seq = latest+1 and incomplete_stuck=False
+    (root lag_seq no longer artificially bumped) must stay H07 FP.
+    """
+    h02 = {
+        "read_offset": 301_000_000,
+        "journal_size": 301_000_140,
+        "next_seq": 2_416_837,
+        "latest_seq": 2_416_836,
+        "lag_seq": 0,
+        "incomplete_stuck": False,
+    }
+    assert is_seq_caught_up_trailing_byte_lag_snapshot(h02) is True
+    assert is_eof_caught_up_progress_snapshot(h02) is False
+
+
+@pytest.mark.asyncio
+async def test_j32_trailing_byte_empty_poll_logs_debug_never_warning(
+    tmp_path, caplog, monkeypatch
+):
+    """
+    J32 quieter mitigation: seq-caught-up trailing bytes must emit DEBUG wait
+    only — never WARNING « unread lag » (H01/H02 soft-stale spam).
+    """
+    journal = TickJournal(str(tmp_path))
+    journal.append(_tick("prior"))
+    journal.save_cursor(TickJournalCursor(last_processed_seq=1))
+
+    trailing = {
+        "read_offset": 301_000_000,
+        "journal_size": 301_000_140,
+        "next_seq": 2_416_837,
+        "latest_seq": 2_416_836,
+        "lag_seq": 0,
+        "incomplete_stuck": False,
+    }
+    monkeypatch.setattr(
+        JournalIncrementalReader,
+        "get_read_progress_snapshot",
+        lambda self: dict(trailing),
+    )
+
+    clock = _FakeClock()
+    stream = JournalTickStream(
+        journal,
+        poll_interval_seconds=0.01,
+        empty_poll_diagnostic_seconds=0.05,
+        clock=clock,
+    )
+    stream_task = asyncio.create_task(stream.start_streaming())
+    try:
+        with caplog.at_level(logging.DEBUG):
+            for _ in range(40):
+                clock.advance(0.02)
+                await asyncio.sleep(0.01)
+                if any(_is_empty_poll_diagnostic(r) for r in caplog.records):
+                    break
+        trailing_records = [
+            r
+            for r in caplog.records
+            if "trailing journal bytes" in r.message.lower()
+            or "seq caught up" in r.message.lower()
+        ]
+        assert trailing_records, "expected DEBUG trailing-byte wait diagnostic"
+        assert all(r.levelno == logging.DEBUG for r in trailing_records)
+        assert not any(
+            "journal unread lag" in r.message.lower() and r.levelno >= logging.WARNING
+            for r in caplog.records
+        )
+        assert not any(
+            "forced tail resync" in r.message.lower() for r in caplog.records
+        )
+    finally:
+        await stream.stop()
+        stream_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await stream_task
 
 
 @pytest.mark.asyncio

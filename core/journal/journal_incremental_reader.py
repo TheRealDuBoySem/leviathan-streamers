@@ -163,10 +163,13 @@ class JournalIncrementalReader:
         records from the journal file.
 
         ``lag_seq`` is how many journal seqs are at or beyond ``next_seq``
-        according to that effective tip (0 when caught up). When the byte
-        cursor is behind EOF (or an incomplete tip is pending) but meta still
-        looks caught up, ``lag_seq`` is at least 1 so callers do not treat
-        unread bytes as idle EOF.
+        according to that effective tip (0 when caught up). A sticky
+        incomplete tip still bumps ``lag_seq`` to at least 1 so callers do
+        not treat a torn line as idle EOF. Mere trailing bytes while the seq
+        cursor is already past ``latest_seq`` (mid-append / not-yet-polled tip,
+        J27 H07 / J32 H01–H02) must **not** invent ``lag_seq=1`` — that FP
+        mis-labeled soft-stale as ``journal_lag`` and spuriously forced
+        tail resync under v0.18.35.
         """
         try:
             journal_size = os.path.getsize(self.__journal.journal_path)
@@ -188,8 +191,9 @@ class JournalIncrementalReader:
         else:
             lag_seq = 0
         incomplete_stuck = self.__pending_incomplete_offset is not None
-        byte_unread = self.__read_offset < journal_size
-        if lag_seq == 0 and (byte_unread or incomplete_stuck):
+        # J32 root: only incomplete tip invents lag when seq looks caught up.
+        # Trailing unread bytes alone are owned by the poll / H07 gate.
+        if lag_seq == 0 and incomplete_stuck:
             lag_seq = 1
         return {
             "read_offset": self.__read_offset,

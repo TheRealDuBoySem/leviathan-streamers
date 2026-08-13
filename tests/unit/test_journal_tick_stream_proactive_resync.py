@@ -81,9 +81,12 @@ def test_force_tail_resync_if_unread_returns_false_when_eof_caught_up(tmp_path):
 
 def test_force_tail_resync_skips_j27_h07_seq_caught_up_trailing_bytes(tmp_path, caplog):
     """
-    REGRESSION J27 H07 @07:54:20 — soft-stale journal_lag lag_seq=1 with
-    offset<size, next_seq>latest_seq, incomplete_stuck=False must NOT force
-    tail resync (false-positive mid-append / not-yet-polled trailing bytes).
+    REGRESSION J27 H07 @07:54:20 — soft-stale journal_lag with offset<size,
+    next_seq>latest_seq, incomplete_stuck=False must NOT force tail resync
+    (false-positive mid-append / not-yet-polled trailing bytes).
+
+    J32 root: trailing bytes alone must not invent lag_seq=1 (was FP noise on
+    H01/H02 soft-stale journal_lag under v0.18.35).
     """
     journal = TickJournal(str(tmp_path))
     journal.append(_tick("t1"))
@@ -98,13 +101,96 @@ def test_force_tail_resync_skips_j27_h07_seq_caught_up_trailing_bytes(tmp_path, 
     snap = stream.get_read_progress_snapshot()
     assert snap["read_offset"] < snap["journal_size"]
     assert snap["next_seq"] > snap["latest_seq"]
-    assert snap["lag_seq"] == 1
+    assert snap["lag_seq"] == 0
     assert snap["incomplete_stuck"] is False
     assert is_seq_caught_up_trailing_byte_lag_snapshot(snap) is True
 
     with caplog.at_level(logging.WARNING):
         assert stream.force_tail_resync_if_unread() is False
     assert not any("forced tail resync" in r.message.lower() for r in caplog.records)
+
+
+# J32 H02 @02:05:55 soft-stale journal_lag + forced tail resync (v0.18.35).
+# Soft-stale showed latest==cursor with journal_lag_seq=1 from artificial bump;
+# reader snapshot matched H07 trailing-byte FP (next = latest+1).
+_J32_H02_SOFT_STALE_TRAILING_BYTE_SNAPSHOT = {
+    "read_offset": 301_000_000,
+    "journal_size": 301_000_140,
+    "next_seq": 2_416_837,
+    "latest_seq": 2_416_836,
+    "lag_seq": 0,
+    "incomplete_stuck": False,
+}
+
+
+def test_force_tail_resync_skips_j32_h02_soft_stale_journal_lag_shape(
+    tmp_path, caplog, monkeypatch
+):
+    """
+    REGRESSION J32 F-J32-06 / H02 @02:05:55 — soft-stale feed_diagnosis=
+    journal_lag with latest_seq==cursor_seq and forced tail resync must stay
+    a no-op once seq is caught up on trailing bytes (root lag_seq not bumped).
+    """
+    journal = TickJournal(str(tmp_path))
+    journal.append(_tick("t1"))
+    journal.flush_meta()
+    stream = JournalTickStream(journal, poll_interval_seconds=0.01)
+
+    monkeypatch.setattr(
+        JournalIncrementalReader,
+        "get_read_progress_snapshot",
+        lambda self: dict(_J32_H02_SOFT_STALE_TRAILING_BYTE_SNAPSHOT),
+    )
+
+    snap = stream.get_read_progress_snapshot()
+    assert snap == _J32_H02_SOFT_STALE_TRAILING_BYTE_SNAPSHOT
+    assert snap["next_seq"] == snap["latest_seq"] + 1
+    assert snap["lag_seq"] == 0
+    assert is_seq_caught_up_trailing_byte_lag_snapshot(snap) is True
+
+    with caplog.at_level(logging.WARNING):
+        assert stream.force_tail_resync_if_unread() is False
+    assert not any("forced tail resync" in r.message.lower() for r in caplog.records)
+
+
+def test_trailing_byte_mid_append_does_not_invent_lag_seq(tmp_path):
+    """
+    J32 root lag=1: seq-caught-up trailing bytes (incomplete_stuck=False) must
+    keep lag_seq=0 so soft-stale does not mis-label quiet mid-append as
+    journal_lag / trigger noisy proactive resync.
+    """
+    journal = TickJournal(str(tmp_path))
+    journal.append(_tick("t1"))
+    journal.flush_meta()
+    reader = JournalIncrementalReader(journal)
+    assert len(reader.poll(1)) == 1
+
+    with open(journal.journal_path, "a", encoding="utf-8") as handle:
+        handle.write(_record_line(2, "inflight")[:40])
+
+    snap = reader.get_read_progress_snapshot()
+    assert snap["read_offset"] < snap["journal_size"]
+    assert snap["next_seq"] > snap["latest_seq"]
+    assert snap["incomplete_stuck"] is False
+    assert snap["lag_seq"] == 0
+
+
+def test_incomplete_stuck_still_bumps_lag_seq_for_real_unread(tmp_path):
+    """Sticky incomplete tip must still report lag_seq>=1 (D7 real unread)."""
+    journal = TickJournal(str(tmp_path))
+    journal.append(_tick("kept"))
+    journal.flush_meta()
+    reader = JournalIncrementalReader(
+        journal,
+        incomplete_record_max_wait_seconds=60.0,
+    )
+    reader.reset_from_seq(2)
+    with open(journal.journal_path, "a", encoding="utf-8") as handle:
+        handle.write(_record_line(2, "torn")[:40])
+    assert reader.poll(2) == []
+    snap = reader.get_read_progress_snapshot()
+    assert snap["incomplete_stuck"] is True
+    assert snap["lag_seq"] >= 1
 
 
 # Exact H11 @11:36:30 fields from leviathan_2026-08-11_11.log (runtime v0.18.35).

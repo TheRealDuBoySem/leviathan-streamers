@@ -828,6 +828,81 @@ def test_j31_h04_soft_stale_rejects_phantom_tip_2319820(tmp_path):
     assert store.seq_index() == [[0, 0], [phantom, 4]]
 
 
+def test_j32_h13_persist_never_rewrites_phantom_tip_2319820(tmp_path):
+    """
+    F-J32-02 / J32 H13: once a coherent tip (~2.45M) is observed, persist must
+    not rewrite sticky fantôme ``2319820`` onto disk (root of Forced→2319820).
+    """
+    meta_path = tmp_path / "tick_journal.meta.json"
+    coherent = 2_450_636  # H13 soft-stale aligned tip @13:20
+    phantom = 2_319_820
+    with open(meta_path, "w", encoding="utf-8") as handle:
+        json.dump(
+            {"latest_seq": coherent, "seen_trade_ids": {}, "seq_index": [[0, 0]]},
+            handle,
+        )
+    store = TickJournalMetaStore(str(meta_path), dedup_window=10)
+    assert store.read_latest_seq_from_disk() == coherent
+
+    # Simulate a poisoned in-memory tip (reload race / stale writer) then persist.
+    store.set_latest_seq(phantom)
+    store.persist()
+    reloaded = json.loads(meta_path.read_text(encoding="utf-8"))
+    assert int(reloaded["latest_seq"]) == coherent
+    assert int(reloaded["latest_seq"]) != phantom
+    assert store.read_latest_seq_from_disk() == coherent
+
+
+def test_j32_h23_persist_never_rewrites_phantom_tip_2454018(tmp_path):
+    """
+    F-J32-02 / J32 H22–H23: post-recovery sticky ``2454018`` must not be
+    re-persisted once a higher coherent tip was observed.
+    """
+    meta_path = tmp_path / "tick_journal.meta.json"
+    coherent = 2_456_168
+    phantom = 2_454_018
+    with open(meta_path, "w", encoding="utf-8") as handle:
+        json.dump(
+            {"latest_seq": coherent, "seen_trade_ids": {}, "seq_index": [[0, 0]]},
+            handle,
+        )
+    store = TickJournalMetaStore(str(meta_path), dedup_window=10)
+    assert store.read_latest_seq_from_disk() == coherent
+
+    store.set_latest_seq(phantom)
+    store.persist()
+    reloaded = json.loads(meta_path.read_text(encoding="utf-8"))
+    assert int(reloaded["latest_seq"]) == coherent
+    assert int(reloaded["latest_seq"]) != phantom
+
+
+def test_j32_ensure_latest_seq_at_least_repairs_sticky_disk_tip(tmp_path):
+    """
+    F-J32-02: Forced/heal path must be able to bump disk tip past sticky
+    fantômes so a fresh TickJournal cannot re-seed ``2319820`` / ``2454018``.
+    """
+    meta_path = tmp_path / "tick_journal.meta.json"
+    phantom = 2_454_018
+    coherent = 2_456_168
+    with open(meta_path, "w", encoding="utf-8") as handle:
+        json.dump(
+            {"latest_seq": phantom, "seen_trade_ids": {}, "seq_index": [[0, 0]]},
+            handle,
+        )
+    store = TickJournalMetaStore(str(meta_path), dedup_window=10)
+    assert store.read_latest_seq_from_disk() == phantom
+
+    assert store.ensure_latest_seq_at_least(coherent) is True
+    store.persist()
+    assert store.latest_seq() == coherent
+    assert store.read_latest_seq_from_disk() == coherent
+    fresh = TickJournalMetaStore(str(meta_path), dedup_window=10)
+    assert fresh.read_latest_seq_from_disk() == coherent
+    assert fresh.read_latest_seq_from_disk() != phantom
+    assert store.ensure_latest_seq_at_least(coherent) is False
+    assert store.ensure_latest_seq_at_least(phantom) is False
+
+
 def test_meta_store_read_latest_seq_fallback_keeps_disk_high_water(tmp_path, mocker):
     """
     Transient meta I/O must not fall back to a boot-era in-memory tip below the
@@ -946,3 +1021,53 @@ def test_meta_store_read_latest_seq_clamps_negative_disk_tip(tmp_path):
         json.dump({"latest_seq": -7, "seen_trade_ids": {}, "seq_index": []}, handle)
     store = TickJournalMetaStore(str(meta_path), dedup_window=10)
     assert store.read_latest_seq_from_disk() == 0
+
+
+def test_max_seq_from_seq_index_skips_non_integer_entries():
+    """J32: sparse seq_index may contain non-int heads — skip without raising."""
+    from core.journal.tick_journal_meta import _max_seq_from_seq_index
+
+    assert _max_seq_from_seq_index("not-a-list") == 0
+    assert _max_seq_from_seq_index([]) == 0
+    assert (
+        _max_seq_from_seq_index(
+            [["bad", 0], None, [], [None], ["12x", 1], [10, 99], [3, 0]]
+        )
+        == 10
+    )
+
+
+def test_j32_set_latest_seq_tolerates_negative_payload_current(tmp_path):
+    """
+    J32 BB-D23-02: poisoned negative latest_seq in payload must not break
+    monotonic set_latest_seq (clamp current to 0 before max).
+    """
+    meta_path = tmp_path / "tick_journal.meta.json"
+    with open(meta_path, "w", encoding="utf-8") as handle:
+        json.dump({"latest_seq": -7, "seen_trade_ids": {}, "seq_index": [[0, 0]]}, handle)
+    store = TickJournalMetaStore(str(meta_path), dedup_window=10)
+    store.set_latest_seq(2_454_018)
+    assert store.latest_seq() == 2_454_018
+
+
+def test_j32_ensure_latest_seq_at_least_rejects_invalid(tmp_path):
+    store = TickJournalMetaStore(str(tmp_path / "m.json"), dedup_window=10)
+    with pytest.raises(ValueError, match="seq must be a non-negative integer"):
+        store.ensure_latest_seq_at_least(-1)
+    with pytest.raises(ValueError, match="seq must be a non-negative integer"):
+        store.ensure_latest_seq_at_least("1")  # type: ignore[arg-type]
+
+
+def test_j32_persist_clamps_negative_tip_defense(tmp_path):
+    """
+    J32 BB-D23-02 defensive: if both payload tip and high-water are negative,
+    persist must rewrite tip to 0 (never leave a negative fantôme on disk).
+    """
+    meta_path = tmp_path / "tick_journal.meta.json"
+    store = TickJournalMetaStore(str(meta_path), dedup_window=10)
+    store._TickJournalMetaStore__payload["latest_seq"] = -3
+    store._TickJournalMetaStore__disk_tip_high_water = -1
+    store.persist()
+    reloaded = json.loads(meta_path.read_text(encoding="utf-8"))
+    assert int(reloaded["latest_seq"]) == 0
+    assert store.latest_seq() == 0

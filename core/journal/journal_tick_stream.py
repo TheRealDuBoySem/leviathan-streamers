@@ -53,13 +53,15 @@ def is_eof_caught_up_progress_snapshot(snapshot: dict) -> bool:
 
 def is_seq_caught_up_trailing_byte_lag_snapshot(snapshot: dict) -> bool:
     """
-    Return True for J27 H07 false-positive soft-stale resync signature.
+    Return True for J27 H07 / J32 H01–H02 false-positive soft-stale resync.
 
-    Evidence H07 @07:54:20: ``offset < size``, ``next_seq > latest_seq``,
-    ``lag_seq=1`` (artificial bump from unread bytes), ``incomplete_stuck=False``.
-    Seq cursor is caught up; trailing bytes are a mid-append / not-yet-polled tip.
-    Force-rebind here abandons an in-flight write and WARN-spams without healing
-    real seq lag — tail-follow poll owns the incomplete-wait window instead.
+    Evidence H07 @07:54:20 (and J32 soft-stale): ``offset < size``,
+    ``next_seq > latest_seq``, ``incomplete_stuck=False``. Historical logs may
+    still show ``lag_seq=1`` from the pre-J32 artificial unread-byte bump;
+    post-root, trailing mid-append keeps ``lag_seq=0``. Seq cursor is caught
+    up; trailing bytes are a mid-append / not-yet-polled tip. Force-rebind here
+    abandons an in-flight write and WARN-spams without healing real seq lag —
+    tail-follow poll owns the incomplete-wait window instead.
     """
     try:
         read_offset = int(snapshot["read_offset"])
@@ -167,6 +169,9 @@ class JournalTickStream(IExchangeStream):
         self.__cursor = journal.load_cursor()
         self.__next_seq = self.__cursor.last_processed_seq + 1
         self.__pending_seq: Optional[int] = None
+        # Set when set_cursor clears an armed pending (tip-split / catch-up
+        # rewind mid-consume). mark_tick_as_processed then no-ops once.
+        self.__pending_invalidated_by_cursor = False
         self.__on_stream_fatal = on_stream_fatal
         self.__empty_poll_since: Optional[float] = None
         self.__last_unread_lag_log_at: Optional[float] = None
@@ -201,13 +206,13 @@ class JournalTickStream(IExchangeStream):
 
         Idle EOF wait (``is_eof_caught_up_progress_snapshot``) is a no-op.
         Seq-caught-up trailing bytes without incomplete wait
-        (``is_seq_caught_up_trailing_byte_lag_snapshot``, J27 H07) are also a
-        no-op — avoid mid-append false-positive rebind / WARN spam.
+        (``is_seq_caught_up_trailing_byte_lag_snapshot``, J27 H07 / J32 H01–H02)
+        are also a no-op — avoid mid-append false-positive rebind / WARN spam.
         Real seq lag / sticky incomplete tip triggers index reload + ``force_rebind``.
 
         Returns:
             True when a resync was performed, False when no-op (EOF caught up
-            or H07 trailing-byte false positive).
+            or H07/J32 trailing-byte false positive).
         """
         snapshot = self.__incremental_reader.get_read_progress_snapshot()
         if is_eof_caught_up_progress_snapshot(snapshot):
@@ -357,8 +362,10 @@ class JournalTickStream(IExchangeStream):
         """D4-04: if still waiting, log journal offset/size/lag after N seconds.
 
         EOF caught-up (``is_eof_caught_up_progress_snapshot``) is DEBUG only —
-        never the WARNING « unread lag » wording (D5-07 / D6-A03). Real unread
-        lag / sticky incomplete tip / byte cursor behind EOF stays WARNING.
+        never the WARNING « unread lag » wording (D5-07 / D6-A03). Seq-caught-up
+        trailing bytes (``is_seq_caught_up_trailing_byte_lag_snapshot``, J27 H07
+        / J32 H01–H02) are also DEBUG — mid-append noise must not WARN-spam.
+        Real unread lag / sticky incomplete tip stays WARNING.
         """
         now = self.__clock()
         if self.__empty_poll_since is None:
@@ -389,6 +396,12 @@ class JournalTickStream(IExchangeStream):
         if is_eof_caught_up_progress_snapshot(snapshot):
             logger.debug(
                 "JournalTickStream waiting for new journal records at EOF " + detail,
+                *args,
+            )
+        elif is_seq_caught_up_trailing_byte_lag_snapshot(snapshot):
+            logger.debug(
+                "JournalTickStream waiting for trailing journal bytes "
+                "(seq caught up) " + detail,
                 *args,
             )
         else:
@@ -454,7 +467,19 @@ class JournalTickStream(IExchangeStream):
             raise ValueError("last_processed_seq must be a non-negative integer")
         self.__cursor = cursor
         self.__next_seq = cursor.last_processed_seq + 1
-        self.__pending_seq = None
+        # BB-D32-01: tip-split / catch-up rewind may run while the engine is
+        # mid-consume (pending armed by wait_for_next_tick). Drop that pending
+        # and release its queue slot so mark_tick in the consumer finally does
+        # not crash the process or leak the join counter.
+        if self.__pending_seq is not None:
+            self.__pending_seq = None
+            self.__pending_invalidated_by_cursor = True
+            try:
+                self.__queue.task_done()
+            except ValueError:
+                pass
+        else:
+            self.__pending_seq = None
         # Catch-up / recovery must not leave stale buffered ticks ahead of the
         # new cursor for the consumer to re-ingest (D7).
         self.__drain_pending_tick_queue()
@@ -474,14 +499,24 @@ class JournalTickStream(IExchangeStream):
                 # task_done without a matching unfinished join counter — ignore.
                 pass
 
+    def has_pending_tick(self) -> bool:
+        """True when wait_for_next_tick armed a seq not yet marked/invalidated."""
+        return self.__pending_seq is not None
+
     async def wait_for_next_tick(self) -> TradeTick:
         seq, tick = await self.__queue.get()
         self.__pending_seq = seq
+        self.__pending_invalidated_by_cursor = False
         return tick
 
     def mark_tick_as_processed(self) -> None:
         seq = self.__pending_seq
         if seq is None:
+            # BB-D32-01: set_cursor rewind mid-consume intentionally cleared
+            # pending — no-op so engine finally does not kill the process.
+            if self.__pending_invalidated_by_cursor:
+                self.__pending_invalidated_by_cursor = False
+                return
             raise RuntimeError(
                 "mark_tick_as_processed called without a pending tick from wait_for_next_tick()"
             )
@@ -490,6 +525,7 @@ class JournalTickStream(IExchangeStream):
             self.__journal.save_cursor(self.__cursor)
         self.__queue.task_done()
         self.__pending_seq = None
+        self.__pending_invalidated_by_cursor = False
 
     async def __aiter__(self) -> AsyncIterator[TradeTick]:
         while not self.is_stopped():
