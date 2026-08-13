@@ -491,3 +491,106 @@ async def test_j28_h19_private_only_flap_does_not_arm_write_liveness(caplog):
     await asyncio.sleep(0.12)
     assert stale_calls == []
     assert guard.consume_last_stale_detection() is None
+
+
+@pytest.mark.asyncio
+async def test_j29_h00_post_flap_write_liveness_pass_arm_count_9(caplog):
+    """J29 H00: write-liveness armed after brief public flap (arm_count=9), PASS.
+
+    Live: long-lived collector carryover J28→J29; post-flap arm_count=9;
+    journal/tip resume — 0 FAIL. No spam re-arm / latch on single flap.
+    """
+    import logging
+
+    stale_calls: list[object] = []
+    guard = PostReconnectWriteLivenessGuard(
+        timeout_seconds=0.08,
+        min_heal_interval_seconds=0.0,
+        on_stale=lambda *_: stale_calls.append(True),
+    )
+
+    for gen in range(1, 9):
+        guard.arm_after_subscriptions_confirmed({"XRPUSDT"}, connect_generation=gen)
+        guard.record_journal_write()
+    assert guard.arm_count == 8
+    assert guard.is_awaiting_write() is False
+
+    with caplog.at_level(logging.INFO):
+        guard.cancel()  # mirrors base_stream.__handle_connect on reconnect
+        guard.arm_after_subscriptions_confirmed({"XRPUSDT"}, connect_generation=9)
+        assert guard.arm_count == 9
+        assert guard.is_awaiting_write() is True
+        assert any(
+            "Post-confirm write-liveness armée" in r.message
+            and "arm_count=9" in r.message
+            and "connect_generation=9" in r.message
+            and "first_boot=False" in r.message
+            for r in caplog.records
+        )
+        guard.record_journal_write()
+        assert guard.is_awaiting_write() is False
+
+    await asyncio.sleep(0.12)
+    assert stale_calls == []
+    assert guard.consume_last_stale_detection() is None
+    assert not any(
+        "write-liveness FAILED" in r.message.lower()
+        or "write-liveness stale" in r.message.lower()
+        for r in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_j29_h21_post_flap_write_liveness_pass_arm_count_2(caplog):
+    """J29 H21: write-liveness armed after public flap (arm_count=2 gen=2), PASS.
+
+    Live post-H03 respawn collector: boot arm then public flap @21:46
+    arm_count=2 connect_generation=2; private flap @21:12 must not re-arm.
+    """
+    import logging
+
+    stale_calls: list[object] = []
+    guard = PostReconnectWriteLivenessGuard(
+        timeout_seconds=0.08,
+        min_heal_interval_seconds=0.0,
+        on_stale=lambda *_: stale_calls.append(True),
+    )
+
+    # Boot confirm (connect_generation=1) satisfied before private flap.
+    guard.arm_after_subscriptions_confirmed({"XRPUSDT"}, connect_generation=1)
+    guard.record_journal_write()
+    assert guard.arm_count == 1
+    assert guard.is_awaiting_write() is False
+
+    with caplog.at_level(logging.INFO):
+        # Private flap @21:12 (~375 ms) — no public confirm → no re-arm.
+        await asyncio.sleep(0.01)
+        assert guard.arm_count == 1
+        assert not any(
+            "Post-confirm write-liveness armée" in r.message and "arm_count=2" in r.message
+            for r in caplog.records
+        )
+
+        # Public flap confirm @21:46.
+        guard.cancel()
+        guard.arm_after_subscriptions_confirmed({"XRPUSDT"}, connect_generation=2)
+        assert guard.arm_count == 2
+        assert guard.is_awaiting_write() is True
+        assert any(
+            "Post-confirm write-liveness armée" in r.message
+            and "arm_count=2" in r.message
+            and "connect_generation=2" in r.message
+            and "first_boot=False" in r.message
+            for r in caplog.records
+        )
+        guard.record_journal_write()
+        assert guard.is_awaiting_write() is False
+
+    await asyncio.sleep(0.12)
+    assert stale_calls == []
+    assert guard.consume_last_stale_detection() is None
+    assert not any(
+        "write-liveness FAILED" in r.message.lower()
+        or "write-liveness stale" in r.message.lower()
+        for r in caplog.records
+    )

@@ -485,6 +485,132 @@ async def test_j28_h19_private_only_flap_does_not_arm_public_tip_correlation(cap
 
 
 @pytest.mark.asyncio
+async def test_j29_h00_brief_1241ms_flap_tip_advances_no_stale(caplog):
+    """J29 H00 @00:39: opaque close → reconnect ~1.241s → tip 2176192 resumes.
+
+    Evidence: brief_public_flap=True, tip frozen only during the flap hole,
+    write-liveness armée arm_count=9 — no post_flap_tip_stale (BB-B5-A1 healthy).
+    """
+    tip = {"seq": 2_176_192}
+    stale_calls: list[object] = []
+    monitor = PostFlapTipCorrelationMonitor(
+        tip_seq_provider=lambda: tip["seq"],
+        stale_window_seconds=0.08,
+        url="wss://ws.bitget.com/v2/ws/public",
+        on_stale=lambda *_: stale_calls.append(True),
+        min_heal_interval_seconds=0.0,
+    )
+
+    with caplog.at_level(logging.INFO):
+        monitor.note_connection_closed(close_wall_ms=39_42_006, close_mono_ms=100)
+        monitor.note_connection_restored(
+            reconnect_wall_ms=39_43_248,
+            reconnect_mono_ms=1_341,  # +1241 ms (J29 H00)
+        )
+
+    assert monitor.last_flap_duration_ms == 1241
+    assert monitor.is_awaiting_tip_progress() is True
+    correlation = next(r.message for r in caplog.records if "post_flap_correlation" in r.message)
+    assert "since_close_ms=1241" in correlation
+    assert "brief_public_flap=True" in correlation
+    assert "tip_seq_before=2176192" in correlation
+    assert "tip_seq_after=2176192" in correlation
+
+    tip["seq"] = 2_176_628  # tip resumes post-flap (H00 tip ~2176628+)
+    assert monitor.record_tip_progress() is True
+    assert monitor.is_awaiting_tip_progress() is False
+
+    with caplog.at_level(logging.WARNING):
+        await asyncio.sleep(0.15)
+
+    assert stale_calls == []
+    assert monitor.consume_last_tip_stale_detection() is None
+    assert not any("post_flap_tip_stale" in r.message for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_j29_h21_brief_1262ms_flap_tip_advances_no_stale(caplog):
+    """J29 H21 @21:46: opaque close → reconnect ~1.262s → tip 2211489 resumes.
+
+    Complements H00: same healthy brief-public-flap signature; write-liveness
+    arm_count=2 connect_generation=2 PASS — no tip-stale heal.
+    """
+    tip = {"seq": 2_211_489}
+    stale_calls: list[object] = []
+    monitor = PostFlapTipCorrelationMonitor(
+        tip_seq_provider=lambda: tip["seq"],
+        stale_window_seconds=0.08,
+        url="wss://ws.bitget.com/v2/ws/public",
+        on_stale=lambda *_: stale_calls.append(True),
+        min_heal_interval_seconds=0.0,
+    )
+
+    with caplog.at_level(logging.INFO):
+        monitor.note_connection_closed(close_wall_ms=21_46_50_067, close_mono_ms=100)
+        monitor.note_connection_restored(
+            reconnect_wall_ms=21_46_51_329,
+            reconnect_mono_ms=1_362,  # +1262 ms (J29 H21)
+        )
+
+    assert monitor.last_flap_duration_ms == 1262
+    correlation = next(r.message for r in caplog.records if "post_flap_correlation" in r.message)
+    assert "since_close_ms=1262" in correlation
+    assert "brief_public_flap=True" in correlation
+    assert "tip_seq_before=2211489" in correlation
+    assert "tip_seq_after=2211489" in correlation
+
+    tip["seq"] = 2_211_715  # tip advances by end of H21
+    assert monitor.record_tip_progress() is True
+
+    with caplog.at_level(logging.WARNING):
+        await asyncio.sleep(0.15)
+
+    assert stale_calls == []
+    assert monitor.consume_last_tip_stale_detection() is None
+    assert not any("post_flap_tip_stale" in r.message for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_j29_h21_private_only_flap_does_not_arm_public_tip_correlation(caplog):
+    """J29 H21 @21:12: private WS flap ~375 ms must not arm public tip correlation.
+
+    SetupExecutor private lost→restored (~375 ms) is independent of the later
+    public collector flap @21:46; without ``note_connection_closed``, restore
+    is a no-op (no false ``post_flap_correlation`` / tip-stale).
+    """
+    tip = {"seq": 2_210_415}
+    stale_calls: list[object] = []
+    monitor = PostFlapTipCorrelationMonitor(
+        tip_seq_provider=lambda: tip["seq"],
+        stale_window_seconds=0.08,
+        url="wss://ws.bitget.com/v2/ws/public",
+        on_stale=lambda *_: stale_calls.append(True),
+        min_heal_interval_seconds=0.0,
+    )
+
+    with caplog.at_level(logging.INFO):
+        # Private flap duration only (~375 ms) — no public close noted.
+        monitor.note_connection_restored(
+            reconnect_wall_ms=21_12_51_738,
+            reconnect_mono_ms=475,
+        )
+
+    assert monitor.last_flap_duration_ms is None
+    assert monitor.is_awaiting_tip_progress() is False
+    assert not any("post_flap_correlation" in r.message for r in caplog.records)
+
+    tip["seq"] = 2_210_615  # tip still advances after private restore (burst)
+    assert monitor.record_tip_progress() is False
+
+    with caplog.at_level(logging.WARNING):
+        await asyncio.sleep(0.15)
+
+    assert stale_calls == []
+    assert monitor.consume_last_tip_stale_detection() is None
+    assert not any("post_flap_tip_stale" in r.message for r in caplog.records)
+
+
+@pytest.mark.asyncio
 async def test_arm_uses_tip_after_as_baseline_when_tip_before_missing(caplog):
     """WS-UP / 0-write: still arm when tip only becomes readable after restore."""
     tip = {"seq": None}
