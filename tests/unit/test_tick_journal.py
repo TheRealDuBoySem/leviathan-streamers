@@ -1,10 +1,11 @@
 """TickJournal facade unit tests (append, cursor, handoff, validation)."""
 
 import os
+import time
 
 import pytest
 
-from core.journal.tick_journal import TickJournal
+from core.journal.tick_journal import META_PERSIST_INTERVAL, TickJournal
 from core.journal.tick_journal_cursor import TickJournalCursor
 from core.journal.tick_journal_meta import TickJournalMetaStore
 from leviathan_common.models.trade_tick import TradeTick
@@ -110,3 +111,91 @@ def test_tick_journal_append_supervisor_handoff_pulse_rejects_empty_symbol(tmp_p
     journal = TickJournal(str(tmp_path))
     with pytest.raises(ValueError, match="symbol must be a non-empty string"):
         journal.append_supervisor_handoff_pulse("   ")
+
+
+def test_j33_h22_partial_burst_leaves_disk_tip_behind_without_idle_flush(tmp_path):
+    """
+    REGRESSION J33 H22 root precondition: after META_PERSIST boundary, a
+    mid-stream burst Δ=23 (disk 2518909 → cursor 2518932 class) leaves durable
+    tip frozen until idle flush / explicit flush_meta.
+    """
+    journal = TickJournal(str(tmp_path), meta_idle_flush_seconds=0.0)
+    for index in range(META_PERSIST_INTERVAL):
+        journal.append(_tick(f"seed{index}", ts=1000 + index))
+    assert (
+        TickJournal(str(tmp_path), meta_idle_flush_seconds=0.0).read_latest_seq_from_disk()
+        == META_PERSIST_INTERVAL
+    )
+
+    overhang = 23  # H22 cursor-disk Δ
+    for index in range(overhang):
+        journal.append(_tick(f"over{index}", ts=2000 + index))
+
+    assert journal.latest_seq() == META_PERSIST_INTERVAL + overhang
+    # Cross-process observer (no writer high-water) sees frozen durable tip.
+    assert (
+        TickJournal(str(tmp_path), meta_idle_flush_seconds=0.0).read_latest_seq_from_disk()
+        == META_PERSIST_INTERVAL
+    )
+    assert journal.has_unpersisted_meta() is True
+
+
+def test_j33_h22_idle_meta_flush_publishes_disk_tip_after_partial_burst(tmp_path):
+    """
+    REGRESSION J33 H22 / F-J33-03: idle meta flush publishes tip after a partial
+    burst so quiet-market silence cannot freeze disk tip mid-stream (Δ ≤
+    META_PERSIST) while journal body / cursor already advanced.
+    """
+    journal = TickJournal(str(tmp_path), meta_idle_flush_seconds=0.05)
+    for index in range(META_PERSIST_INTERVAL):
+        journal.append(_tick(f"seed{index}", ts=1000 + index))
+
+    overhang = 23
+    for index in range(overhang):
+        journal.append(_tick(f"over{index}", ts=2000 + index))
+    expected = META_PERSIST_INTERVAL + overhang
+    assert journal.latest_seq() == expected
+    assert journal.has_unpersisted_meta() is True
+
+    deadline = time.monotonic() + 2.0
+    disk_tip = META_PERSIST_INTERVAL
+    while time.monotonic() < deadline:
+        disk_tip = TickJournal(
+            str(tmp_path), meta_idle_flush_seconds=0.0
+        ).read_latest_seq_from_disk()
+        if disk_tip == expected and not journal.has_unpersisted_meta():
+            break
+        time.sleep(0.02)
+
+    assert disk_tip == expected
+    assert journal.has_unpersisted_meta() is False
+    assert journal.flush_meta_if_dirty() is False
+
+
+def test_tick_journal_flush_meta_if_dirty_publishes_partial_burst(tmp_path):
+    journal = TickJournal(str(tmp_path), meta_idle_flush_seconds=0.0)
+    for index in range(META_PERSIST_INTERVAL):
+        journal.append(_tick(f"seed{index}", ts=1000 + index))
+    journal.append(_tick("partial", ts=3000))
+    assert journal.has_unpersisted_meta() is True
+    assert journal.flush_meta_if_dirty() is True
+    assert journal.has_unpersisted_meta() is False
+    assert (
+        TickJournal(str(tmp_path), meta_idle_flush_seconds=0.0).read_latest_seq_from_disk()
+        == META_PERSIST_INTERVAL + 1
+    )
+
+
+def test_tick_journal_flush_meta_if_dirty_is_noop_when_clean(tmp_path):
+    journal = TickJournal(str(tmp_path), meta_idle_flush_seconds=0.0)
+    for index in range(META_PERSIST_INTERVAL):
+        journal.append(_tick(f"seed{index}", ts=1000 + index))
+    assert journal.has_unpersisted_meta() is False
+    assert journal.flush_meta_if_dirty() is False
+
+
+def test_tick_journal_rejects_invalid_meta_idle_flush_seconds(tmp_path):
+    with pytest.raises(ValueError, match="meta_idle_flush_seconds must be >= 0"):
+        TickJournal(str(tmp_path), meta_idle_flush_seconds=-0.1)
+    with pytest.raises(TypeError, match="meta_idle_flush_seconds must be a number"):
+        TickJournal(str(tmp_path), meta_idle_flush_seconds="1")  # type: ignore[arg-type]

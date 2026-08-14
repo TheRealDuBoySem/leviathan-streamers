@@ -7,10 +7,11 @@ Pattern: Facade / Repository — coordinates meta, seq index, compaction, and ap
 from __future__ import annotations
 
 import json
+import logging
 import os
 import threading
 import time
-from typing import Iterator
+from typing import Iterator, Optional
 
 from core.journal.journal_file_lock import JournalFileLock
 from core.journal.journal_incremental_reader import (
@@ -26,6 +27,8 @@ from core.journal.tick_journal_meta import TickJournalMetaStore
 from core.journal.tick_journal_seq_index import SEQ_INDEX_INTERVAL, TickJournalSeqIndex
 from leviathan_common.models.trade_tick import TradeTick
 
+logger = logging.getLogger(__name__)
+
 # Re-exports retained for existing `from core.journal.tick_journal import ...` sites.
 __all__ = [
     "COMPACT_MIN_LAG_SEQ",
@@ -33,6 +36,7 @@ __all__ = [
     "DEFAULT_EMPTY_POLL_DIAGNOSTIC_SECONDS",
     "DEFAULT_INCOMPLETE_RECORD_MAX_WAIT_SECONDS",
     "JournalIncrementalReader",
+    "META_IDLE_FLUSH_SECONDS",
     "META_PERSIST_INTERVAL",
     "SEQ_INDEX_INTERVAL",
     "TickJournal",
@@ -43,6 +47,12 @@ __all__ = [
 
 DEFAULT_DEDUP_WINDOW = 10_000
 META_PERSIST_INTERVAL = 50
+# J33 H22 / F-J33-03: after a partial burst (< META_PERSIST_INTERVAL appends),
+# publish durable tip once the writer goes quiet so disk tip cannot freeze
+# mid-stream while journal body / engine cursor already advanced (H22 Δ+23
+# disk=2518909 cursor=2518932 → false disk_tip_frozen_famine). Keep well below
+# soft-stale (~30s) and tick_stall (~120s). 0 disables idle flush (tests).
+META_IDLE_FLUSH_SECONDS = 2.0
 # D4-04: emit unread lag diagnostics while cold-start / tail-follow yields nothing.
 DEFAULT_EMPTY_POLL_DIAGNOSTIC_SECONDS = 5.0
 
@@ -60,6 +70,9 @@ class TickJournal:
     Invariants:
         - latest_seq is monotonically non-decreasing.
         - Each seq maps to at most one tick line in the journal file.
+        - Durable meta tip is published at least every META_PERSIST_INTERVAL
+          appends, and after a quiet gap (META_IDLE_FLUSH_SECONDS) when a
+          partial burst left meta dirty (J33 H22 anti-freeze).
     """
 
     def __init__(
@@ -68,6 +81,7 @@ class TickJournal:
         *,
         dedup_window: int = DEFAULT_DEDUP_WINDOW,
         seq_index_interval: int = SEQ_INDEX_INTERVAL,
+        meta_idle_flush_seconds: float = META_IDLE_FLUSH_SECONDS,
     ) -> None:
         if not isinstance(checkpoint_dir, str) or not checkpoint_dir.strip():
             raise ValueError("checkpoint_dir must be a non-empty string")
@@ -75,6 +89,12 @@ class TickJournal:
             raise ValueError("dedup_window must be positive")
         if seq_index_interval <= 0:
             raise ValueError("seq_index_interval must be positive")
+        if isinstance(meta_idle_flush_seconds, bool) or not isinstance(
+            meta_idle_flush_seconds, (int, float)
+        ):
+            raise TypeError("meta_idle_flush_seconds must be a number")
+        if float(meta_idle_flush_seconds) < 0:
+            raise ValueError("meta_idle_flush_seconds must be >= 0")
         normalized_dir = checkpoint_dir.strip()
         self.__checkpoint_dir = normalized_dir
         self.__journal_path = os.path.join(normalized_dir, _TICK_JOURNAL_FILE)
@@ -84,6 +104,9 @@ class TickJournal:
         self.__quarantine_path = os.path.join(normalized_dir, _TICK_JOURNAL_QUARANTINE_FILE)
         self.__thread_lock = threading.Lock()
         self.__append_counter = 0
+        self.__meta_idle_flush_seconds = float(meta_idle_flush_seconds)
+        self.__meta_dirty = False
+        self.__idle_flush_timer: Optional[threading.Timer] = None
         os.makedirs(normalized_dir, exist_ok=True)
         self.__meta_store = TickJournalMetaStore(
             self.__meta_path,
@@ -164,8 +187,27 @@ class TickJournal:
             with self.__thread_lock:
                 advanced = self.__meta_store.ensure_latest_seq_at_least(seq)
                 if advanced:
-                    self.__meta_store.persist()
+                    self.__persist_meta_locked()
                 return advanced
+
+    def has_unpersisted_meta(self) -> bool:
+        """Return True when in-memory tip advances are not yet durable on disk."""
+        with self.__thread_lock:
+            return bool(self.__meta_dirty)
+
+    def flush_meta_if_dirty(self) -> bool:
+        """
+        Persist meta when a partial burst left the durable tip behind.
+
+        Returns:
+            True when a dirty tip was flushed, else False.
+        """
+        with self.__thread_lock:
+            dirty = bool(self.__meta_dirty)
+        if not dirty:
+            return False
+        self.flush_meta()
+        return True
 
     def load_cursor(self) -> TickJournalCursor:
         if not os.path.exists(self.__cursor_path):
@@ -213,13 +255,51 @@ class TickJournal:
                 self.__seq_index.record(next_seq, byte_offset)
                 self.__append_counter += 1
                 if self.__append_counter % META_PERSIST_INTERVAL == 0:
-                    self.__meta_store.persist()
+                    self.__persist_meta_locked()
+                else:
+                    self.__mark_meta_dirty_locked()
                 return next_seq
 
     def flush_meta(self) -> None:
         with JournalFileLock(self.__lock_path):
             with self.__thread_lock:
-                self.__meta_store.persist()
+                self.__persist_meta_locked()
+
+    def __persist_meta_locked(self) -> None:
+        """Persist meta and clear dirty / idle-flush timer (caller holds locks)."""
+        self.__cancel_idle_flush_timer_locked()
+        self.__meta_store.persist()
+        self.__meta_dirty = False
+
+    def __mark_meta_dirty_locked(self) -> None:
+        """Mark tip dirty and (re)arm idle flush so quiet gaps publish tip."""
+        self.__meta_dirty = True
+        if self.__meta_idle_flush_seconds <= 0:
+            return
+        self.__cancel_idle_flush_timer_locked()
+        timer = threading.Timer(
+            self.__meta_idle_flush_seconds,
+            self.__idle_flush_meta_callback,
+        )
+        timer.daemon = True
+        self.__idle_flush_timer = timer
+        timer.start()
+
+    def __cancel_idle_flush_timer_locked(self) -> None:
+        timer = self.__idle_flush_timer
+        self.__idle_flush_timer = None
+        if timer is not None:
+            timer.cancel()
+
+    def __idle_flush_meta_callback(self) -> None:
+        """Timer target: publish durable tip after a quiet gap (J33 H22)."""
+        try:
+            self.flush_meta_if_dirty()
+        except Exception as exc:  # pragma: no cover - defensive I/O path
+            logger.warning(
+                "TickJournal: idle meta tip flush failed (will retry on next append): %s",
+                exc,
+            )
 
     def append_supervisor_handoff_pulse(self, symbol: str) -> int:
         """Append a synthetic tick so overlap handoff can detect a new collector process."""
