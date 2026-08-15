@@ -1071,3 +1071,88 @@ def test_j32_persist_clamps_negative_tip_defense(tmp_path):
     reloaded = json.loads(meta_path.read_text(encoding="utf-8"))
     assert int(reloaded["latest_seq"]) == 0
     assert store.latest_seq() == 0
+
+
+def test_j34_persist_skips_clobber_when_disk_tip_ahead_of_memory(tmp_path):
+    """
+    REGRESSION J34 / F-J34-01: stale-process persist must not overwrite a newer
+    collector tip / dedup on disk (H20 ahead=508 class).
+    """
+    meta_path = tmp_path / "tick_journal.meta.json"
+    with open(meta_path, "w", encoding="utf-8") as handle:
+        json.dump(
+            {"latest_seq": 50, "seen_trade_ids": {}, "seq_index": [[0, 0]]},
+            handle,
+        )
+    stale_reader = TickJournalMetaStore(str(meta_path), dedup_window=10)
+    assert stale_reader.latest_seq() == 50
+
+    # Collector publishes a higher tip (+ dedup) while the reader is idle.
+    with open(meta_path, "w", encoding="utf-8") as handle:
+        json.dump(
+            {
+                "latest_seq": 558,
+                "seen_trade_ids": {"XRPUSDT": ["collector-trade"]},
+                "seq_index": [[0, 0], [500, 42]],
+            },
+            handle,
+        )
+
+    stale_reader.persist()
+    reloaded = json.loads(meta_path.read_text(encoding="utf-8"))
+    assert int(reloaded["latest_seq"]) == 558
+    assert reloaded["seen_trade_ids"] == {"XRPUSDT": ["collector-trade"]}
+    assert stale_reader.latest_seq() == 558
+    assert stale_reader.read_latest_seq_from_disk() == 558
+
+
+def test_j34_persist_normalizes_negative_disk_tip_when_comparing(tmp_path):
+    """
+    Coverage F-J34-01: persist path clamps a negative on-disk latest_seq to 0
+    before comparing against memory tip (does not adopt a negative fantôme).
+    """
+    meta_path = tmp_path / "tick_journal.meta.json"
+    with open(meta_path, "w", encoding="utf-8") as handle:
+        json.dump(
+            {"latest_seq": -9, "seen_trade_ids": {}, "seq_index": [[0, 0]]},
+            handle,
+        )
+    store = TickJournalMetaStore(str(meta_path), dedup_window=10)
+    store.set_latest_seq(12)
+    store.persist()
+    reloaded = json.loads(meta_path.read_text(encoding="utf-8"))
+    assert int(reloaded["latest_seq"]) == 12
+    assert store.latest_seq() == 12
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        OSError("meta vanished mid-persist"),
+        json.JSONDecodeError("bad", "doc", 0),
+        ValueError("corrupt tip"),
+    ],
+    ids=["oserror", "json", "value"],
+)
+def test_j34_persist_tolerates_disk_meta_io_errors(tmp_path, mocker, error):
+    """
+    Coverage F-J34-01: OSError / JSONDecodeError / ValueError while reading
+    disk tip during persist fall back to disk_tip=0 and still write memory tip.
+    """
+    meta_path = tmp_path / "tick_journal.meta.json"
+    with open(meta_path, "w", encoding="utf-8") as handle:
+        json.dump(
+            {"latest_seq": 3, "seen_trade_ids": {}, "seq_index": [[0, 0]]},
+            handle,
+        )
+    store = TickJournalMetaStore(str(meta_path), dedup_window=10)
+    store.set_latest_seq(20)
+    mocker.patch.object(
+        TickJournalMetaStore,
+        "load_payload",
+        side_effect=error,
+    )
+    store.persist()
+    reloaded = json.loads(meta_path.read_text(encoding="utf-8"))
+    assert int(reloaded["latest_seq"]) == 20
+

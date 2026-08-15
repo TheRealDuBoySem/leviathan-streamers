@@ -163,9 +163,31 @@ class TickJournalMetaStore:
     def persist(self) -> None:
         # J32 / BB-D23-02: never rewrite a sticky fantôme below the coherent
         # high-water (H13 ``2319820`` / H22–H23 ``2454018``).
-        tip = max(int(self.__payload.get("latest_seq", 0)), int(self.__disk_tip_high_water))
-        if tip < 0:
-            tip = 0
+        # J34 / F-J34-01: also never clobber a newer on-disk tip published by
+        # another writer (collector). A stale engine/reader persist must adopt
+        # the disk tip into high-water and skip the rewrite so dedup/seq_index
+        # owned by the collector are not rolled back (H17/H20 under-report).
+        memory_tip = max(
+            int(self.__payload.get("latest_seq", 0)),
+            int(self.__disk_tip_high_water),
+        )
+        if memory_tip < 0:
+            memory_tip = 0
+        disk_tip = 0
+        try:
+            if os.path.exists(self.__meta_path):
+                disk_meta = self.load_payload(self.__meta_path)
+                raw = int(disk_meta.get("latest_seq", 0))
+                if raw < 0:
+                    raw = 0
+                disk_tip = max(raw, _max_seq_from_seq_index(disk_meta.get("seq_index")))
+        except (OSError, json.JSONDecodeError, ValueError):
+            disk_tip = 0
+        if disk_tip > memory_tip:
+            self.__payload["latest_seq"] = disk_tip
+            self.__disk_tip_high_water = disk_tip
+            return
+        tip = max(memory_tip, disk_tip)
         self.__payload["latest_seq"] = tip
         self.__disk_tip_high_water = tip
         payload = dict(self.__payload)

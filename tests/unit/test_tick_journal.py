@@ -5,6 +5,7 @@ import time
 
 import pytest
 
+from core.journal.journal_file_lock import JournalFileLock
 from core.journal.tick_journal import META_PERSIST_INTERVAL, TickJournal
 from core.journal.tick_journal_cursor import TickJournalCursor
 from core.journal.tick_journal_meta import TickJournalMetaStore
@@ -199,3 +200,118 @@ def test_tick_journal_rejects_invalid_meta_idle_flush_seconds(tmp_path):
         TickJournal(str(tmp_path), meta_idle_flush_seconds=-0.1)
     with pytest.raises(TypeError, match="meta_idle_flush_seconds must be a number"):
         TickJournal(str(tmp_path), meta_idle_flush_seconds="1")  # type: ignore[arg-type]
+
+
+def test_j34_h20_stale_reader_flush_meta_does_not_rewind_collector_tip(tmp_path):
+    """
+    REGRESSION J34 / F-J34-01 (H20 ahead=508): engine checkpoint ``flush_meta``
+    on a read-only TickJournal must not rewrite collector tip backward.
+
+    Root: collector publishes tip every META_PERSIST / idle flush; engine holds
+    a separate journal instance whose in-memory tip lags. Checkpoint flush was
+    clobbering durable meta with the stale tip while journal body stayed ahead
+    → mid-stream under-report repaired by F-J33-01.
+    """
+    collector = TickJournal(str(tmp_path), meta_idle_flush_seconds=0.0)
+    for index in range(META_PERSIST_INTERVAL):
+        collector.append(_tick(f"seed{index}", ts=1000 + index))
+    assert (
+        TickJournal(str(tmp_path), meta_idle_flush_seconds=0.0).read_latest_seq_from_disk()
+        == META_PERSIST_INTERVAL
+    )
+
+    # Engine-like reader attached at the post-persist tip (boot / last observe).
+    engine_journal = TickJournal(str(tmp_path), meta_idle_flush_seconds=0.0)
+    assert engine_journal.read_latest_seq_from_disk() == META_PERSIST_INTERVAL
+    assert engine_journal.has_unpersisted_meta() is False
+
+    # Collector burst past the reader snapshot (H20-class overhang 508).
+    overhang = 508
+    for index in range(overhang):
+        collector.append(_tick(f"burst{index}", ts=2000 + index))
+    collector.flush_meta()
+    live_tip = META_PERSIST_INTERVAL + overhang
+    assert collector.latest_seq() == live_tip
+    assert (
+        TickJournal(str(tmp_path), meta_idle_flush_seconds=0.0).read_latest_seq_from_disk()
+        == live_tip
+    )
+
+    # Checkpoint-style flush from the stale reader must leave durable tip intact.
+    engine_journal.flush_meta()
+    assert (
+        TickJournal(str(tmp_path), meta_idle_flush_seconds=0.0).read_latest_seq_from_disk()
+        == live_tip
+    )
+    assert engine_journal.has_unpersisted_meta() is False
+
+
+def test_j34_h17_stale_reader_flush_meta_noop_when_clean_keeps_tip(tmp_path):
+    """
+    REGRESSION J34 / F-J34-01 (H17 ahead=369): clean reader flush is a no-op
+    and cannot under-report tip vs collector body progress.
+    """
+    collector = TickJournal(str(tmp_path), meta_idle_flush_seconds=0.0)
+    for index in range(META_PERSIST_INTERVAL):
+        collector.append(_tick(f"seed{index}", ts=1000 + index))
+    reader = TickJournal(str(tmp_path), meta_idle_flush_seconds=0.0)
+
+    overhang = 369
+    for index in range(overhang):
+        collector.append(_tick(f"h17{index}", ts=3000 + index))
+    collector.flush_meta()
+    live_tip = META_PERSIST_INTERVAL + overhang
+
+    reader.flush_meta()
+    assert reader.has_unpersisted_meta() is False
+    assert (
+        TickJournal(str(tmp_path), meta_idle_flush_seconds=0.0).read_latest_seq_from_disk()
+        == live_tip
+    )
+
+
+def test_j34_flush_meta_still_publishes_writer_dirty_tip(tmp_path):
+    """Writer flush_meta must still publish a dirty partial burst (F-J33-03)."""
+    journal = TickJournal(str(tmp_path), meta_idle_flush_seconds=0.0)
+    for index in range(META_PERSIST_INTERVAL):
+        journal.append(_tick(f"seed{index}", ts=1000 + index))
+    journal.append(_tick("partial", ts=4000))
+    assert journal.has_unpersisted_meta() is True
+    assert journal.flush_meta() is True
+    assert journal.has_unpersisted_meta() is False
+    assert (
+        TickJournal(str(tmp_path), meta_idle_flush_seconds=0.0).read_latest_seq_from_disk()
+        == META_PERSIST_INTERVAL + 1
+    )
+
+
+def test_j34_flush_meta_returns_false_when_dirty_cleared_under_lock(tmp_path, mocker):
+    """
+    Coverage / race: outer dirty check passes, then another path clears dirty
+    before the locked re-check → flush_meta returns False without persist.
+    """
+    journal = TickJournal(str(tmp_path), meta_idle_flush_seconds=0.0)
+    for index in range(META_PERSIST_INTERVAL):
+        journal.append(_tick(f"seed{index}", ts=1000 + index))
+    journal.append(_tick("race-dirty", ts=5000))
+    assert journal.has_unpersisted_meta() is True
+    # Durable tip still at interval boundary until a successful dirty flush.
+    assert (
+        TickJournal(str(tmp_path), meta_idle_flush_seconds=0.0).read_latest_seq_from_disk()
+        == META_PERSIST_INTERVAL
+    )
+
+    original_enter = JournalFileLock.__enter__
+
+    def _enter_clearing_dirty(self):
+        journal._TickJournal__meta_dirty = False
+        return original_enter(self)
+
+    mocker.patch.object(JournalFileLock, "__enter__", _enter_clearing_dirty)
+    assert journal.flush_meta() is False
+    assert journal.has_unpersisted_meta() is False
+    # Persist skipped: disk tip remains at the last auto-persist boundary.
+    assert (
+        TickJournal(str(tmp_path), meta_idle_flush_seconds=0.0).read_latest_seq_from_disk()
+        == META_PERSIST_INTERVAL
+    )

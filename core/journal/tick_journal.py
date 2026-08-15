@@ -73,6 +73,9 @@ class TickJournal:
         - Durable meta tip is published at least every META_PERSIST_INTERVAL
           appends, and after a quiet gap (META_IDLE_FLUSH_SECONDS) when a
           partial burst left meta dirty (J33 H22 anti-freeze).
+        - ``flush_meta`` / ``flush_meta_if_dirty`` only rewrite disk meta when
+          this instance dirtied tip (J34: engine reader must not clobber
+          collector tip).
     """
 
     def __init__(
@@ -202,12 +205,7 @@ class TickJournal:
         Returns:
             True when a dirty tip was flushed, else False.
         """
-        with self.__thread_lock:
-            dirty = bool(self.__meta_dirty)
-        if not dirty:
-            return False
-        self.flush_meta()
-        return True
+        return self.flush_meta()
 
     def load_cursor(self) -> TickJournalCursor:
         if not os.path.exists(self.__cursor_path):
@@ -260,10 +258,28 @@ class TickJournal:
                     self.__mark_meta_dirty_locked()
                 return next_seq
 
-    def flush_meta(self) -> None:
+    def flush_meta(self) -> bool:
+        """
+        Persist meta when this writer has unpersisted tip advances.
+
+        J34 / F-J34-01: a clean (non-writer) journal — e.g. the engine's
+        checkpoint-attached TickJournal — must not rewrite durable meta.
+        Doing so clobbers the collector tip with a stale in-memory snapshot
+        (H17 ahead=369 / H20 ahead=508) while journal body stays ahead.
+
+        Returns:
+            True when a dirty tip was flushed, else False.
+        """
+        with self.__thread_lock:
+            dirty = bool(self.__meta_dirty)
+        if not dirty:
+            return False
         with JournalFileLock(self.__lock_path):
             with self.__thread_lock:
+                if not self.__meta_dirty:
+                    return False
                 self.__persist_meta_locked()
+        return True
 
     def __persist_meta_locked(self) -> None:
         """Persist meta and clear dirty / idle-flush timer (caller holds locks)."""
