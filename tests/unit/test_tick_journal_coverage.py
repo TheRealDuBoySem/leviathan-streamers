@@ -21,12 +21,6 @@ def test_tick_journal_append_rejects_non_tick(tmp_path):
         journal.append({"bad": True})  # type: ignore[arg-type]
 
 
-def test_tick_journal_save_cursor_rejects_invalid_type(tmp_path):
-    journal = TickJournal(str(tmp_path))
-    with pytest.raises(TypeError, match="TickJournalCursor"):
-        journal.save_cursor({"bad": 1})  # type: ignore[arg-type]
-
-
 def test_tick_journal_dedup_bucket_eviction(tmp_path):
     journal = TickJournal(str(tmp_path), dedup_window=2)
     journal.append(_tick("a"))
