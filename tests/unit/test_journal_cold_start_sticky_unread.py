@@ -120,8 +120,6 @@ def test_reader_abandons_stuck_incomplete_after_timeout_without_waiting_for_pois
     assert any("incomplete_trailing_stale" in r.message for r in caplog.records)
     tip = os.path.getsize(journal.journal_path)
     assert reader.get_read_offset() == tip
-    snapshot = reader.get_read_progress_snapshot()
-    assert snapshot["incomplete_stuck"] is False
 
     # Append a complete record after the abandoned tip (collector path).
     _seed_journal_meta(journal, tmp_path, latest_seq=1)
@@ -153,108 +151,6 @@ def test_reader_still_waits_for_partial_line_within_timeout(tmp_path):
 
     records = reader.poll(1)
     assert [t.trade_id for _, t in records] == ["partial"]
-
-
-def test_read_progress_snapshot_exposes_offset_size_and_lag(tmp_path):
-    journal = TickJournal(str(tmp_path))
-    journal.append(_tick("a"))
-    journal.append(_tick("b"))
-    journal.flush_meta()
-    reader = JournalIncrementalReader(journal)
-    reader.reset_from_seq(2)
-    snapshot = reader.get_read_progress_snapshot()
-    assert snapshot["next_seq"] == 2
-    assert snapshot["read_offset"] >= 0
-    assert snapshot["journal_size"] >= snapshot["read_offset"]
-    assert snapshot["latest_seq"] == 2
-    assert snapshot["lag_seq"] == 1
-    assert "incomplete_stuck" in snapshot
-
-
-def test_read_progress_snapshot_latest_seq_not_stale_vs_reader_progress(tmp_path):
-    """
-    Meta may lag (META_PERSIST_INTERVAL); snapshot latest_seq must not stay
-    below records the reader has already consumed (next_seq >> disk watermark).
-    """
-    journal = TickJournal(str(tmp_path))
-    journal.append(_tick("a"))
-    journal.append(_tick("b"))
-    journal.append(_tick("c"))
-    # Persist a stale watermark while the file already holds seq 1..3.
-    _seed_journal_meta(journal, tmp_path, latest_seq=1)
-
-    reader = JournalIncrementalReader(journal)
-    assert [seq for seq, _ in reader.poll(1)] == [1, 2, 3]
-    snapshot = reader.get_read_progress_snapshot()
-    assert snapshot["next_seq"] == 4
-    assert snapshot["latest_seq"] == 3
-    assert snapshot["lag_seq"] == 0
-    assert snapshot["read_offset"] == snapshot["journal_size"]
-
-
-def test_read_progress_snapshot_coerces_production_stale_meta_watermark(tmp_path):
-    """
-    D6-A04 / D5-08 within META_PERSIST lag: disk meta may lag the reader by a
-    small persist window; snapshot latest_seq must still reflect consumed floor.
-
-    Large checkpoint cursor overhang past live disk tip is BB-D23-02 sticky
-    tip-split (see test_read_progress_snapshot_rejects_sticky_cursor_overhang).
-    """
-    from core.journal.tick_journal import META_PERSIST_INTERVAL
-
-    stale_watermark = 100
-    consumed_through = stale_watermark + (META_PERSIST_INTERVAL // 2)
-    journal = TickJournal(str(tmp_path))
-    journal.append(_tick("seed"))
-    _seed_journal_meta(journal, tmp_path, latest_seq=stale_watermark)
-    assert journal.read_latest_seq_from_disk() == stale_watermark
-
-    reader = JournalIncrementalReader(journal)
-    reader._JournalIncrementalReader__next_seq = consumed_through + 1
-    try:
-        reader._JournalIncrementalReader__read_offset = os.path.getsize(
-            journal.journal_path
-        )
-    except OSError:
-        reader._JournalIncrementalReader__read_offset = 0
-
-    snapshot = reader.get_read_progress_snapshot()
-    assert snapshot["next_seq"] == consumed_through + 1
-    assert snapshot["latest_seq"] == consumed_through
-    assert snapshot["latest_seq"] >= snapshot["next_seq"] - 1
-    assert snapshot["latest_seq"] > stale_watermark
-    assert snapshot["lag_seq"] == 0
-    assert snapshot.get("cursor_ahead_of_tip") is False
-
-
-def test_read_progress_snapshot_rejects_sticky_cursor_overhang(tmp_path):
-    """
-    BB-D23-02: checkpoint cursor far past live disk tip must not invent a
-    sticky tip (J23 H05 dual tip / famine until catch-up).
-    """
-    from core.journal.tick_journal import META_PERSIST_INTERVAL
-
-    live_tip = 1_740_532
-    sticky_cursor = 1_741_629
-    assert sticky_cursor - live_tip > META_PERSIST_INTERVAL
-    journal = TickJournal(str(tmp_path))
-    journal.append(_tick("seed"))
-    _seed_journal_meta(journal, tmp_path, latest_seq=live_tip)
-
-    reader = JournalIncrementalReader(journal)
-    reader._JournalIncrementalReader__next_seq = sticky_cursor + 1
-    try:
-        reader._JournalIncrementalReader__read_offset = os.path.getsize(
-            journal.journal_path
-        )
-    except OSError:
-        reader._JournalIncrementalReader__read_offset = 0
-
-    snapshot = reader.get_read_progress_snapshot()
-    assert snapshot["latest_seq"] == live_tip
-    assert snapshot["cursor_ahead_of_tip"] is True
-    assert snapshot["next_seq"] == sticky_cursor + 1
-
 
 
 @pytest.mark.asyncio

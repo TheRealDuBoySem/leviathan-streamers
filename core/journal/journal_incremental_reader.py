@@ -6,14 +6,21 @@ Pattern: Iterator / Cursor — polls new records without rescanning the full fil
 
 from __future__ import annotations
 
-import json
 import logging
 import os
-import time
 from typing import TYPE_CHECKING, Callable, Optional
 
+from core.journal.journal_incomplete_fragment import (
+    IncompleteTrailingFragmentPolicy,
+    incomplete_trailing_skip_reason,
+    is_in_progress_journal_fragment,
+)
 from core.journal.journal_io import preview_journal_line, should_log_invalid_line
-from core.journal.tick_journal_codec import tick_from_dict
+from core.journal.journal_read_progress import compute_read_progress_snapshot
+from core.journal.journal_record_line_parser import (
+    JournalRecordParseError,
+    parse_journal_record_line,
+)
 from leviathan_common.models.trade_tick import TradeTick
 
 if TYPE_CHECKING:
@@ -23,18 +30,12 @@ logger = logging.getLogger(__name__)
 
 # D4-09: bound wait for a `{`-prefixed incomplete trailing write before skipping.
 DEFAULT_INCOMPLETE_RECORD_MAX_WAIT_SECONDS = 2.0
-# Align with TickJournal.META_PERSIST_INTERVAL — tip inflate past disk only within
-# this window; larger overhang is sticky cursor (BB-D23-02).
-_TIP_META_LAG_TOLERANCE_SEQ = 50
 
-
-def is_in_progress_journal_fragment(fragment: str) -> bool:
-    """
-    Return True when an incomplete trailing fragment may still become a valid
-    JSONL record (writer mid-append). Torn suffixes that do not start with ``{``
-    are never valid journal objects and must not block the reader (D4-09).
-    """
-    return fragment.lstrip().startswith("{")
+__all__ = [
+    "DEFAULT_INCOMPLETE_RECORD_MAX_WAIT_SECONDS",
+    "JournalIncrementalReader",
+    "is_in_progress_journal_fragment",
+]
 
 
 class JournalIncrementalReader:
@@ -69,10 +70,6 @@ class JournalIncrementalReader:
         incomplete_record_max_wait_seconds: float = DEFAULT_INCOMPLETE_RECORD_MAX_WAIT_SECONDS,
         clock: Optional[Callable[[], float]] = None,
     ) -> None:
-        if incomplete_record_max_wait_seconds <= 0:
-            raise ValueError("incomplete_record_max_wait_seconds must be positive")
-        if clock is not None and not callable(clock):
-            raise TypeError("clock must be callable")
         self.__journal = journal
         self.__read_offset = 0
         self.__next_seq = 1
@@ -81,18 +78,14 @@ class JournalIncrementalReader:
         self.__last_skip_reason: Optional[str] = None
         self.__last_known_size: Optional[int] = None
         self.__past_eof_resync_logged = False
-        self.__incomplete_record_max_wait_seconds = float(
-            incomplete_record_max_wait_seconds
+        self.__incomplete_policy = IncompleteTrailingFragmentPolicy(
+            incomplete_record_max_wait_seconds=incomplete_record_max_wait_seconds,
+            clock=clock,
         )
-        # Resolve monotonic at init so tests can monkeypatch time.monotonic.
-        self.__clock: Callable[[], float] = clock if clock is not None else time.monotonic
         # After skipping a torn EOF suffix, the cursor is already at the next
         # record BOL even when the previous byte is not ``\n`` (D4-09). Tie the
         # mark to the offset so a later mid-line sticky seek (D4-03) still aligns.
         self.__logical_bol_offset: Optional[int] = 0
-        self.__pending_incomplete_offset: Optional[int] = None
-        self.__pending_incomplete_started_at: Optional[float] = None
-        self.__pending_incomplete_length: Optional[int] = None
 
     def reset_from_seq(self, start_seq: int) -> None:
         if not isinstance(start_seq, int) or start_seq < 0:
@@ -154,56 +147,19 @@ class JournalIncrementalReader:
         return self.__consecutive_parse_failures
 
     def get_read_progress_snapshot(self) -> dict:
-        """
-        Return offset/size/seq lag for cold-start observability (D4-04).
-
-        ``latest_seq`` is ``max(disk meta, reader-observed floor)`` so a stale
-        meta watermark (``META_PERSIST_INTERVAL``) cannot report
-        ``next_seq >> latest_seq`` after the reader has already consumed those
-        records from the journal file.
-
-        ``lag_seq`` is how many journal seqs are at or beyond ``next_seq``
-        according to that effective tip (0 when caught up). A sticky
-        incomplete tip still bumps ``lag_seq`` to at least 1 so callers do
-        not treat a torn line as idle EOF. Mere trailing bytes while the seq
-        cursor is already past ``latest_seq`` (mid-append / not-yet-polled tip,
-        J27 H07 / J32 H01–H02) must **not** invent ``lag_seq=1`` — that FP
-        mis-labeled soft-stale as ``journal_lag`` and spuriously forced
-        tail resync under v0.18.35.
-        """
+        """Return offset/size/seq lag for cold-start observability (D4-04)."""
         try:
             journal_size = os.path.getsize(self.__journal.journal_path)
         except OSError:
             journal_size = 0
         disk_latest = self.__journal.read_latest_seq_from_disk()
-        # Records already consumed imply tip >= next_seq - 1 even if meta lags —
-        # but only within META_PERSIST lag. A checkpoint cursor past the live
-        # disk tip (BB-D23-02 sticky watermark) must not invent a phantom tip.
-        observed_floor = max(0, self.__next_seq - 1)
-        overhang = observed_floor - int(disk_latest)
-        cursor_ahead_of_tip = overhang > _TIP_META_LAG_TOLERANCE_SEQ
-        if cursor_ahead_of_tip:
-            latest_seq = int(disk_latest)
-        else:
-            latest_seq = max(int(disk_latest), observed_floor)
-        if latest_seq >= self.__next_seq:
-            lag_seq = latest_seq - self.__next_seq + 1
-        else:
-            lag_seq = 0
-        incomplete_stuck = self.__pending_incomplete_offset is not None
-        # J32 root: only incomplete tip invents lag when seq looks caught up.
-        # Trailing unread bytes alone are owned by the poll / H07 gate.
-        if lag_seq == 0 and incomplete_stuck:
-            lag_seq = 1
-        return {
-            "read_offset": self.__read_offset,
-            "journal_size": journal_size,
-            "next_seq": self.__next_seq,
-            "latest_seq": latest_seq,
-            "lag_seq": lag_seq,
-            "incomplete_stuck": incomplete_stuck,
-            "cursor_ahead_of_tip": cursor_ahead_of_tip,
-        }
+        return compute_read_progress_snapshot(
+            read_offset=self.__read_offset,
+            journal_size=journal_size,
+            next_seq=self.__next_seq,
+            disk_latest_seq=disk_latest,
+            incomplete_stuck=self.__incomplete_policy.is_stuck,
+        )
 
     def poll(self, start_seq: int) -> list[tuple[int, TradeTick]]:
         if start_seq != self.__next_seq:
@@ -284,9 +240,7 @@ class JournalIncrementalReader:
         self.__logical_bol_offset = self.__read_offset
 
     def __clear_incomplete_wait_state(self) -> None:
-        self.__pending_incomplete_offset = None
-        self.__pending_incomplete_started_at = None
-        self.__pending_incomplete_length = None
+        self.__incomplete_policy.clear()
 
     def __abandon_incomplete_tip_at_cursor(self, *, force: bool) -> None:
         """
@@ -354,30 +308,10 @@ class JournalIncrementalReader:
             )
 
     def __should_skip_incomplete_trailing_fragment(self, fragment: str) -> bool:
-        """
-        Decide whether an EOF fragment without newline must be skipped now.
-
-        Postconditions:
-            Returns True for torn non-JSON suffixes, or for `{`-prefixed
-            fragments that have remained incomplete past the configured wait.
-        """
-        if not fragment:
-            return False
-        if not is_in_progress_journal_fragment(fragment):
-            return True
-        now = self.__clock()
-        fragment_len = len(fragment)
-        if (
-            self.__pending_incomplete_offset != self.__read_offset
-            or self.__pending_incomplete_length != fragment_len
-            or self.__pending_incomplete_started_at is None
-        ):
-            self.__pending_incomplete_offset = self.__read_offset
-            self.__pending_incomplete_started_at = now
-            self.__pending_incomplete_length = fragment_len
-            return False
-        elapsed = now - self.__pending_incomplete_started_at
-        return elapsed >= self.__incomplete_record_max_wait_seconds
+        return self.__incomplete_policy.should_skip_now(
+            offset=self.__read_offset,
+            fragment=fragment,
+        )
 
     def __skip_incomplete_trailing_fragment(
         self,
@@ -386,10 +320,7 @@ class JournalIncrementalReader:
         reason: Optional[str] = None,
     ) -> None:
         if reason is None:
-            if is_in_progress_journal_fragment(fragment):
-                reason = "incomplete_trailing_stale"
-            else:
-                reason = "incomplete_trailing_poison"
+            reason = incomplete_trailing_skip_reason(fragment)
         if reason == "incomplete_trailing_cold_attach":
             logger.warning(
                 "JournalIncrementalReader abandoned incomplete journal tip on attach "
@@ -402,25 +333,14 @@ class JournalIncrementalReader:
         self.__clear_incomplete_wait_state()
 
     def __parse_complete_line(self, line: str) -> Optional[tuple[int, TradeTick]]:
-        stripped = line.strip()
-        if not stripped:
+        parsed = parse_journal_record_line(line)
+        if parsed is None:
             return None
-        try:
-            record = json.loads(stripped)
-        except json.JSONDecodeError as exc:
-            self.__quarantine_invalid_line(stripped, reason=str(exc))
-            return None
-        if not isinstance(record, dict):
-            self.__quarantine_invalid_line(stripped, reason="record is not a JSON object")
-            return None
-        try:
-            seq = int(record["seq"])
-            tick = tick_from_dict(record["tick"])
-        except (KeyError, TypeError, ValueError) as exc:
-            self.__quarantine_invalid_line(stripped, reason=str(exc))
+        if isinstance(parsed, JournalRecordParseError):
+            self.__quarantine_invalid_line(parsed.line, reason=parsed.reason)
             return None
         self.__log_recovery_if_needed()
-        return seq, tick
+        return parsed
 
     def __resync_if_journal_rewritten(self, journal_path: str) -> None:
         """

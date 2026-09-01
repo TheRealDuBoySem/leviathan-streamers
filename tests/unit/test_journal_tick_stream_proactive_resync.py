@@ -58,9 +58,9 @@ def test_force_rebind_from_seq_ignores_sticky_high_water(tmp_path):
     # Corrupt sticky offset into the middle of the last line (simulates D4-03 land).
     reader._JournalIncrementalReader__read_offset = sticky - 5
     reader._JournalIncrementalReader__logical_bol_offset = None
-    reader._JournalIncrementalReader__pending_incomplete_offset = sticky - 5
-    reader._JournalIncrementalReader__pending_incomplete_started_at = 1.0
-    reader._JournalIncrementalReader__pending_incomplete_length = 10
+    incomplete_fragment = '{"seq":1,'
+    policy = reader._JournalIncrementalReader__incomplete_policy
+    policy.should_skip_now(offset=sticky - 5, fragment=incomplete_fragment)
 
     reader.force_rebind_from_seq(4)
 

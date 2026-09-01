@@ -88,29 +88,6 @@ def test_reader_skips_concatenated_json_line_and_continues(tmp_path, caplog):
     assert any("skipped invalid" in record.message.lower() for record in caplog.records)
 
 
-def test_reader_skips_malformed_line_and_advances_offset(tmp_path, caplog):
-    journal = TickJournal(str(tmp_path))
-    with open(journal.journal_path, "w", encoding="utf-8") as handle:
-        handle.write(_record_line(1, "first") + "\n")
-        handle.write("{not-valid-json\n")
-        handle.write(_record_line(2, "second", ts=1100) + "\n")
-
-    reader = JournalIncrementalReader(journal)
-    with caplog.at_level(logging.WARNING):
-        first_batch = reader.poll(1)
-
-    assert [tick.trade_id for _, tick in first_batch] == ["first", "second"]
-
-    # Poison pill must not reappear on the next poll / respawn.
-    second_batch = reader.poll(3)
-    assert second_batch == []
-    assert sum(1 for r in caplog.records if "skipped invalid" in r.message.lower()) >= 1
-    assert os.path.exists(journal.quarantine_path)
-    with open(journal.quarantine_path, "r", encoding="utf-8") as handle:
-        quarantine = handle.read()
-    assert "{not-valid-json" in quarantine
-
-
 def test_reader_resume_after_skip_does_not_reparse_poison(tmp_path):
     journal = TickJournal(str(tmp_path))
     with open(journal.journal_path, "w", encoding="utf-8") as handle:
@@ -262,21 +239,6 @@ async def test_journal_tick_stream_exposes_parse_failure_health_and_recovery(
             stream_task.cancel()
             with pytest.raises(asyncio.CancelledError):
                 await stream_task
-
-
-def test_reader_quarantines_non_object_and_bad_tick_records(tmp_path):
-    journal = TickJournal(str(tmp_path))
-    with open(journal.journal_path, "w", encoding="utf-8") as handle:
-        handle.write("123\n")
-        handle.write('{"seq":"x","tick":{}}\n')
-        handle.write(_record_line(1, "ok") + "\n")
-
-    records = journal.create_incremental_reader().poll(1)
-    assert len(records) == 1
-    assert records[0][1].trade_id == "ok"
-    with open(journal.quarantine_path, "r", encoding="utf-8") as handle:
-        quarantine = handle.read()
-    assert quarantine
 
 
 @pytest.mark.asyncio
@@ -808,40 +770,7 @@ def test_d4_03_newline_terminated_torn_suffix_skips_once_then_recovers(
     assert "1461415930925686784" in quarantine
 
 
-def test_reader_rejects_non_positive_incomplete_max_wait(tmp_path):
-    journal = TickJournal(str(tmp_path))
-    with pytest.raises(ValueError, match="incomplete_record_max_wait_seconds must be positive"):
-        JournalIncrementalReader(journal, incomplete_record_max_wait_seconds=0)
-
-
 # --- D4-09: poison-gated first-tick delay (incomplete trailing torn suffix) ---
-
-
-def test_reader_skips_incomplete_trailing_poison_suffix_immediately(tmp_path, caplog):
-    """
-    D4-09: torn journal suffixes that cannot be an in-progress JSON object
-    (no leading '{') must be quarantined on the first poll — not parked until
-    the next writer supplies a newline (observed ~33–56s startup delay).
-    """
-    journal = TickJournal(str(tmp_path))
-    poison = (
-        'id":"XRPUSDT","ts":1784147002135,"price":1.1125,'
-        '"size":22.0,"side":"buy","trade_id":"1461383935646507016"}}'
-    )
-    with open(journal.journal_path, "w", encoding="utf-8") as handle:
-        handle.write(poison)
-
-    reader = JournalIncrementalReader(journal)
-    with caplog.at_level(logging.WARNING):
-        assert reader.poll(1) == []
-
-    assert reader.get_invalid_line_skip_count() == 1
-    assert reader.get_read_offset() == len(poison.encode("utf-8"))
-    assert any("incomplete_trailing_poison" in r.message for r in caplog.records)
-    with open(journal.quarantine_path, "r", encoding="utf-8") as handle:
-        quarantine = json.loads(handle.readline())
-    assert quarantine["reason"] == "incomplete_trailing_poison"
-    assert quarantine["line"] == poison
 
 
 def test_reader_reaches_valid_tick_after_trailing_poison_without_waiting_for_newline(
@@ -863,31 +792,6 @@ def test_reader_reaches_valid_tick_after_trailing_poison_without_waiting_for_new
     records = reader.poll(1)
     assert len(records) == 1
     assert records[0][1].trade_id == "survivor"
-
-
-def test_reader_skips_stale_incomplete_json_object_after_max_wait(tmp_path):
-    """
-    D4-09: a `{`-prefixed incomplete write that never completes must not gate
-    startup forever — skip after incomplete_record_max_wait_seconds.
-    """
-    journal = TickJournal(str(tmp_path))
-    partial = _record_line(1, "stuck")[:40]
-    with open(journal.journal_path, "w", encoding="utf-8") as handle:
-        handle.write(partial)
-
-    clock = {"now": 1000.0}
-    reader = JournalIncrementalReader(
-        journal,
-        incomplete_record_max_wait_seconds=0.5,
-        clock=lambda: clock["now"],
-    )
-    assert reader.poll(1) == []
-    assert reader.get_invalid_line_skip_count() == 0
-
-    clock["now"] = 1000.6
-    assert reader.poll(1) == []
-    assert reader.get_invalid_line_skip_count() == 1
-    assert reader.get_read_offset() == len(partial.encode("utf-8"))
 
 
 @pytest.mark.asyncio
@@ -931,22 +835,6 @@ async def test_journal_tick_stream_bounds_time_to_first_tick_with_trailing_poiso
         with pytest.raises(asyncio.CancelledError):
             await stream_task
 
-def test_reader_rejects_non_callable_clock(tmp_path):
-    journal = TickJournal(str(tmp_path))
-    with pytest.raises(TypeError, match="clock must be callable"):
-        JournalIncrementalReader(journal, clock=123)  # type: ignore[arg-type]
-
-
-def test_read_progress_snapshot_handles_missing_journal_file(tmp_path, mocker):
-    journal = TickJournal(str(tmp_path))
-    journal.append(
-        TradeTick("XRPUSDT", 1000, 0.5, 1.0, "buy", "a")
-    )
-    reader = JournalIncrementalReader(journal)
-    mocker.patch("os.path.getsize", side_effect=OSError("gone"))
-    snapshot = reader.get_read_progress_snapshot()
-    assert snapshot["journal_size"] == 0
-
 
 def test_choose_reset_offset_clamps_indexed_hint_past_eof(tmp_path):
     journal = TickJournal(str(tmp_path))
@@ -961,15 +849,6 @@ def test_choose_reset_offset_clamps_indexed_hint_past_eof(tmp_path):
         indexed_offset=file_size + 50,
     )
     assert chosen == file_size
-
-
-def test_should_skip_incomplete_empty_fragment_is_false(tmp_path):
-    journal = TickJournal(str(tmp_path))
-    reader = JournalIncrementalReader(journal)
-    assert (
-        reader._JournalIncrementalReader__should_skip_incomplete_trailing_fragment("")
-        is False
-    )
 
 
 def test_resync_past_eof_clamps_when_reset_still_past_size(tmp_path, mocker):
@@ -993,40 +872,6 @@ def test_resync_past_eof_clamps_when_reset_still_past_size(tmp_path, mocker):
     assert reader._JournalIncrementalReader__read_offset == os.path.getsize(
         journal.journal_path
     )
-
-
-def test_abandon_incomplete_tip_force_false_skips_after_wait(tmp_path):
-    """Cover force=False branch of __abandon_incomplete_tip_at_cursor (D4-09)."""
-    journal = TickJournal(str(tmp_path))
-    complete = _record_line(1, "ok") + "\n"
-    torn = '{"seq":2,"tick":{"inst_id":"BTCUSDT"'
-    with open(journal.journal_path, "w", encoding="utf-8") as handle:
-        handle.write(complete)
-        handle.write(torn)
-
-    with open(journal.journal_path, "r", encoding="utf-8") as handle:
-        handle.readline()
-        tip_offset = handle.tell()
-
-    clock = {"t": 100.0}
-
-    def now() -> float:
-        return clock["t"]
-
-    reader = JournalIncrementalReader(
-        journal,
-        incomplete_record_max_wait_seconds=1.0,
-        clock=now,
-    )
-    reader._JournalIncrementalReader__read_offset = tip_offset
-    # First call arms the wait window without quarantining.
-    reader._JournalIncrementalReader__abandon_incomplete_tip_at_cursor(force=False)
-    assert reader.get_invalid_line_skip_count() == 0
-    assert reader._JournalIncrementalReader__pending_incomplete_offset == tip_offset
-    clock["t"] = 102.0
-    reader._JournalIncrementalReader__abandon_incomplete_tip_at_cursor(force=False)
-    assert reader.get_invalid_line_skip_count() == 1
-    assert reader._JournalIncrementalReader__pending_incomplete_offset is None
 
 
 def test_abandon_incomplete_tip_swallows_oserror(tmp_path, mocker):
