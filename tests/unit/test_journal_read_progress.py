@@ -1,12 +1,16 @@
-"""Unit tests for journal read-progress snapshot computation."""
+"""Unit tests for journal read-progress snapshot computation and classifiers."""
 
 from __future__ import annotations
 
 import os
 
+import pytest
+
 from core.journal.journal_read_progress import (
     TIP_META_LAG_TOLERANCE_SEQ,
     compute_read_progress_snapshot,
+    is_eof_caught_up_progress_snapshot,
+    is_seq_caught_up_trailing_byte_lag_snapshot,
 )
 from core.journal.journal_incremental_reader import JournalIncrementalReader
 from core.journal.journal_io import atomic_write_json
@@ -185,3 +189,175 @@ def test_read_progress_snapshot_handles_missing_journal_file(tmp_path, mocker):
     mocker.patch("os.path.getsize", side_effect=OSError("gone"))
     snapshot = reader.get_read_progress_snapshot()
     assert snapshot["journal_size"] == 0
+
+
+# D6-A03 / H01 pre-restart storm signature (offset==size, lag_seq=0, not stuck).
+_D6_EOF_CAUGHT_UP_SNAPSHOT = {
+    "read_offset": 2_702_052,
+    "journal_size": 2_702_052,
+    "next_seq": 560_247,
+    "latest_seq": 560_232,  # stale/regressive meta tip (H01-A03) — must not force WARNING
+    "lag_seq": 0,
+    "incomplete_stuck": False,
+}
+
+
+@pytest.mark.parametrize(
+    "snapshot,expected_eof",
+    [
+        (_D6_EOF_CAUGHT_UP_SNAPSHOT, True),
+        (
+            {
+                "read_offset": 100,
+                "journal_size": 100,
+                "next_seq": 5,
+                "latest_seq": 4,
+                "lag_seq": 0,
+                "incomplete_stuck": False,
+            },
+            True,
+        ),
+        (
+            {
+                "read_offset": 0,
+                "journal_size": 0,
+                "next_seq": 1,
+                "latest_seq": 0,
+                "lag_seq": 0,
+                "incomplete_stuck": False,
+            },
+            True,
+        ),
+        (
+            {
+                "read_offset": 50,
+                "journal_size": 100,
+                "next_seq": 2,
+                "latest_seq": 5,
+                "lag_seq": 4,
+                "incomplete_stuck": False,
+            },
+            False,
+        ),
+        (
+            {
+                "read_offset": 100,
+                "journal_size": 100,
+                "next_seq": 6,
+                "latest_seq": 5,
+                "lag_seq": 1,
+                "incomplete_stuck": True,
+            },
+            False,
+        ),
+        (
+            {
+                "read_offset": 99,
+                "journal_size": 100,
+                "next_seq": 5,
+                "latest_seq": 4,
+                "lag_seq": 0,
+                "incomplete_stuck": False,
+            },
+            False,
+        ),
+    ],
+)
+def test_is_eof_caught_up_progress_snapshot_d6_contract(snapshot, expected_eof):
+    """D6-A03: lag_seq=0 + offset>=size + not stuck ⇒ EOF wait, never 'unread lag'."""
+    assert is_eof_caught_up_progress_snapshot(snapshot) is expected_eof
+
+
+def test_is_eof_caught_up_progress_snapshot_rejects_invalid_payload():
+    """D6-A03: malformed snapshot fields must raise ValueError (contract guard)."""
+    with pytest.raises(ValueError, match="progress snapshot must expose"):
+        is_eof_caught_up_progress_snapshot({"read_offset": 0})
+    with pytest.raises(ValueError, match="progress snapshot must expose"):
+        is_eof_caught_up_progress_snapshot(
+            {
+                "read_offset": "bad",
+                "journal_size": 1,
+                "lag_seq": 0,
+                "incomplete_stuck": False,
+            }
+        )
+
+
+def test_is_seq_caught_up_trailing_byte_lag_snapshot_j27_h07_contract():
+    """J27 H07: exact forced-resync false-positive fields must be recognized."""
+    h07 = {
+        "read_offset": 254_937_853,
+        "journal_size": 254_938_264,
+        "next_seq": 2_063_837,
+        "latest_seq": 2_063_836,
+        "lag_seq": 1,
+        "incomplete_stuck": False,
+    }
+    assert is_seq_caught_up_trailing_byte_lag_snapshot(h07) is True
+    assert is_eof_caught_up_progress_snapshot(h07) is False
+
+    # Real seq lag (tip at/ahead of next) is not the H07 false positive.
+    assert (
+        is_seq_caught_up_trailing_byte_lag_snapshot(
+            {
+                "read_offset": 50,
+                "journal_size": 100,
+                "next_seq": 10,
+                "latest_seq": 12,
+                "lag_seq": 3,
+                "incomplete_stuck": False,
+            }
+        )
+        is False
+    )
+    # Sticky incomplete still needs force-resync path (not the H07 no-op).
+    assert (
+        is_seq_caught_up_trailing_byte_lag_snapshot(
+            {
+                "read_offset": 50,
+                "journal_size": 100,
+                "next_seq": 10,
+                "latest_seq": 9,
+                "lag_seq": 1,
+                "incomplete_stuck": True,
+            }
+        )
+        is False
+    )
+    with pytest.raises(ValueError, match="progress snapshot must expose"):
+        is_seq_caught_up_trailing_byte_lag_snapshot({"read_offset": 0})
+
+
+def test_is_seq_caught_up_trailing_byte_lag_snapshot_j31_h11_contract():
+    """
+    REGRESSION J31 F-J31-08 / H11 @11:36:30 — exact forced-resync log fields
+    (v0.18.35 before J27 gate in v0.18.36) must stay recognized as trailing-byte FP.
+    """
+    h11 = {
+        "read_offset": 293_973_475,
+        "journal_size": 293_973_613,
+        "next_seq": 2_347_069,
+        "latest_seq": 2_347_068,
+        "lag_seq": 1,
+        "incomplete_stuck": False,
+    }
+    assert is_seq_caught_up_trailing_byte_lag_snapshot(h11) is True
+    assert is_eof_caught_up_progress_snapshot(h11) is False
+
+
+def test_is_seq_caught_up_trailing_byte_lag_snapshot_j32_h01_h02_contract():
+    """
+    REGRESSION J32 F-J32-06 / H01–H02 — soft-stale journal_lag + forced tail
+    resync under v0.18.35 with next_seq = latest+1 and incomplete_stuck=False
+    (root lag_seq no longer artificially bumped) must stay H07 FP.
+    """
+    h02 = {
+        "read_offset": 301_000_000,
+        "journal_size": 301_000_140,
+        "next_seq": 2_416_837,
+        "latest_seq": 2_416_836,
+        "lag_seq": 0,
+        "incomplete_stuck": False,
+    }
+    assert is_seq_caught_up_trailing_byte_lag_snapshot(h02) is True
+    assert is_eof_caught_up_progress_snapshot(h02) is False

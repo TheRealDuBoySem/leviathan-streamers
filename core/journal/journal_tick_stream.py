@@ -13,6 +13,10 @@ import time
 from typing import AsyncIterator, Awaitable, Callable, List, Optional
 
 from core.interfaces.base import IExchangeStream, IPriceObserver
+from core.journal.journal_read_progress import (
+    is_eof_caught_up_progress_snapshot,
+    is_seq_caught_up_trailing_byte_lag_snapshot,
+)
 from core.journal.tick_journal import DEFAULT_EMPTY_POLL_DIAGNOSTIC_SECONDS, TickJournal
 from core.journal.tick_journal_cursor import TickJournalCursor
 from leviathan_common.models.trade_tick import TradeTick
@@ -28,57 +32,6 @@ class JournalStreamFatalError(RuntimeError):
     def __init__(self, reason: str) -> None:
         super().__init__(reason)
         self.reason = reason
-
-
-def is_eof_caught_up_progress_snapshot(snapshot: dict) -> bool:
-    """
-    Return True when an empty poll is idle EOF wait, not unread lag (D5-07 / D6-A03).
-
-    The D6 pre-restart storm logged WARNING while already showing
-    ``offset==size``, ``lag_seq=0``, ``incomplete_stuck=False`` (sometimes with
-    stale ``latest_seq < next_seq``). That signature must never be WARNING.
-    """
-    try:
-        read_offset = int(snapshot["read_offset"])
-        journal_size = int(snapshot["journal_size"])
-        lag_seq = int(snapshot["lag_seq"])
-        incomplete_stuck = bool(snapshot["incomplete_stuck"])
-    except (KeyError, TypeError, ValueError) as exc:
-        raise ValueError(
-            "progress snapshot must expose read_offset, journal_size, "
-            f"lag_seq, incomplete_stuck as numeric/bool fields: {exc}"
-        ) from exc
-    return read_offset >= journal_size and lag_seq == 0 and not incomplete_stuck
-
-
-def is_seq_caught_up_trailing_byte_lag_snapshot(snapshot: dict) -> bool:
-    """
-    Return True for J27 H07 / J32 H01–H02 false-positive soft-stale resync.
-
-    Evidence H07 @07:54:20 (and J32 soft-stale): ``offset < size``,
-    ``next_seq > latest_seq``, ``incomplete_stuck=False``. Historical logs may
-    still show ``lag_seq=1`` from the pre-J32 artificial unread-byte bump;
-    post-root, trailing mid-append keeps ``lag_seq=0``. Seq cursor is caught
-    up; trailing bytes are a mid-append / not-yet-polled tip. Force-rebind here
-    abandons an in-flight write and WARN-spams without healing real seq lag —
-    tail-follow poll owns the incomplete-wait window instead.
-    """
-    try:
-        read_offset = int(snapshot["read_offset"])
-        journal_size = int(snapshot["journal_size"])
-        next_seq = int(snapshot["next_seq"])
-        latest_seq = int(snapshot["latest_seq"])
-        incomplete_stuck = bool(snapshot["incomplete_stuck"])
-    except (KeyError, TypeError, ValueError) as exc:
-        raise ValueError(
-            "progress snapshot must expose read_offset, journal_size, "
-            f"next_seq, latest_seq, incomplete_stuck as numeric/bool fields: {exc}"
-        ) from exc
-    return (
-        not incomplete_stuck
-        and read_offset < journal_size
-        and next_seq > latest_seq
-    )
 
 
 def _validate_symbol(symbol: str, param_name: str = "symbol") -> None:

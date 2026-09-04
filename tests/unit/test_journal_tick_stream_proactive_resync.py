@@ -15,8 +15,8 @@ import pytest
 
 from core.journal.journal_incremental_reader import JournalIncrementalReader
 from core.journal.journal_io import atomic_write_json
-from core.journal.journal_tick_stream import (
-    JournalTickStream,
+from core.journal.journal_tick_stream import JournalTickStream
+from core.journal.journal_read_progress import (
     is_seq_caught_up_trailing_byte_lag_snapshot,
 )
 from core.journal.tick_journal import TickJournal
